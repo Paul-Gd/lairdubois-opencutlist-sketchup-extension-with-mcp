@@ -1,0 +1,875 @@
+module Ladb::OpenCutList
+
+  require_relative 'controller'
+  require_relative '../mcp/mcp_error'
+  require_relative '../mcp/mcp_bridge_server'
+  require_relative '../mcp/mcp_part_helper'
+  require_relative '../worker/cutlist/cutlist_generate_worker'
+  require_relative '../worker/cutlist/cutlist_part_update_worker'
+  require_relative '../model/cutlist/instance_info'
+  require_relative '../model/attributes/definition_attributes'
+  require_relative '../model/attributes/material_attributes'
+  require_relative '../utils/dimension_utils'
+
+  # Commands exposed to AI tools through the MCP bridge.
+  #
+  # Reads and most updates reuse OpenCutList's own workers, so the result is
+  # exactly what the UI would produce. Only part creation and the direct
+  # transformation operations are implemented here.
+  class McpController < Controller
+
+    include McpPartHelper
+
+    MATERIAL_TYPES = {
+      'unknown' => MaterialAttributes::TYPE_UNKNOWN,
+      'unknow' => MaterialAttributes::TYPE_UNKNOWN,
+      'solid_wood' => MaterialAttributes::TYPE_SOLID_WOOD,
+      'sheet_good' => MaterialAttributes::TYPE_SHEET_GOOD,
+      'dimensional' => MaterialAttributes::TYPE_DIMENSIONAL,
+      'edge' => MaterialAttributes::TYPE_EDGE,
+      'hardware' => MaterialAttributes::TYPE_HARDWARE,
+      'veneer' => MaterialAttributes::TYPE_VENEER,
+      'machining' => MaterialAttributes::TYPE_MACHINING
+    }.freeze
+
+    DEFAULT_PARTS_LIMIT = 200
+    MAX_PARTS_LIMIT = 1000
+    MAX_PART_COUNT = 1000
+
+    def initialize
+      super('mcp')
+      @bridge_server = nil
+    end
+
+    def setup_commands
+
+      # Bridge lifecycle
+      PLUGIN.register_command('mcp_bridge_start') { |_params| bridge_start_command }
+      PLUGIN.register_command('mcp_bridge_stop') { |_params| bridge_stop_command }
+      PLUGIN.register_command('mcp_bridge_status') { |_params| bridge_status_command }
+
+      # Diagnostics
+      PLUGIN.register_command('mcp_ping') { |_params| ping_command }
+      PLUGIN.register_command('mcp_model_info') { |params| model_info_command(params) }
+
+      # Parts
+      PLUGIN.register_command('mcp_parts_list') { |params| parts_list_command(params) }
+      PLUGIN.register_command('mcp_part_get') { |params| part_get_command(params) }
+      PLUGIN.register_command('mcp_part_create') { |params| part_create_command(params) }
+      PLUGIN.register_command('mcp_part_update') { |params| part_update_command(params) }
+      PLUGIN.register_command('mcp_part_resize') { |params| part_resize_command(params) }
+      PLUGIN.register_command('mcp_part_move') { |params| part_move_command(params) }
+      PLUGIN.register_command('mcp_part_delete') { |params| part_delete_command(params) }
+      PLUGIN.register_command('mcp_parts_select') { |params| parts_select_command(params) }
+
+      # Materials
+      PLUGIN.register_command('mcp_materials_list') { |params| materials_list_command(params) }
+      PLUGIN.register_command('mcp_material_create') { |params| material_create_command(params) }
+
+      # Cutlist
+      PLUGIN.register_command('mcp_cutlist_get') { |params| cutlist_get_command(params) }
+
+    end
+
+    # Called by Plugin#stop_mcp_bridge on SketchUp quit.
+    def stop_bridge
+      @bridge_server.stop unless @bridge_server.nil?
+    end
+
+    private
+
+    # ---------------------------------------------------------------------
+    # Bridge lifecycle / diagnostics
+
+    def bridge_start_command
+      @bridge_server ||= McpBridgeServer.new(lambda { |method, params| PLUGIN.execute_command(method, params) })
+      @bridge_server.start
+    rescue Exception => e
+      PLUGIN.dump_exception(e, false)
+      {
+        :running => false,
+        :error => "#{e.class}: #{e.message}"
+      }
+    end
+
+    def bridge_stop_command
+      @bridge_server.stop unless @bridge_server.nil?
+      {
+        :running => false,
+        :discovery_file => _discovery_file
+      }
+    end
+
+    def bridge_status_command
+      return @bridge_server.status unless @bridge_server.nil?
+      {
+        :running => false,
+        :port => nil,
+        :discovery_file => _discovery_file,
+        :version => _version,
+        :model => _model_name
+      }
+    end
+
+    def ping_command
+      {
+        :pong => true,
+        :version => _version,
+        :model => _model_name
+      }
+    end
+
+    def model_info_command(params)
+      model = _require_model
+      cutlist = _cutlist
+      parts = cutlist.get_parts
+
+      {
+        :model_name => model.name,
+        :model_path => model.path,
+        :length_unit => DimensionUtils.length_unit,
+        :length_unit_name => _length_unit_name(DimensionUtils.length_unit),
+        :part_count => parts.length,
+        :real_part_count => parts.count { |part| !part.virtual },
+        :virtual_part_count => parts.count { |part| part.virtual },
+        :selection_count => model.selection.length,
+        :active_path => model.active_path.to_a.map { |entity| entity.respond_to?(:name) ? entity.name : entity.to_s },
+        :version => _version
+      }
+    end
+
+    # ---------------------------------------------------------------------
+    # Parts
+
+    def parts_list_command(params)
+      p = _deep_symbolize(params || {})
+      filters = p[:filters].is_a?(Hash) ? p[:filters] : {}
+      include_virtual = p[:include_virtual] == true
+      limit = _clamp((p[:limit] || DEFAULT_PARTS_LIMIT).to_i, 1, MAX_PARTS_LIMIT)
+      offset = [ (p[:offset] || 0).to_i, 0 ].max
+
+      cutlist = _cutlist
+      parts = cutlist.get_parts
+
+      unless include_virtual
+        parts = parts.reject { |part| part.virtual }
+      end
+
+      if (name_contains = filters[:name_contains])
+        needle = name_contains.to_s.downcase
+        parts = parts.select { |part| part.name.to_s.downcase.include?(needle) }
+      end
+      if (material = filters[:material])
+        material = material.to_s
+        parts = parts.select { |part| part.group.material_name.to_s == material }
+      end
+      if (tag = filters[:tag])
+        tag = tag.to_s
+        parts = parts.select { |part| Array(part.tags).include?(tag) }
+      end
+      if (group_id = filters[:group_id])
+        group_id = group_id.to_s
+        parts = parts.select { |part| part.group.id.to_s == group_id }
+      end
+
+      total = parts.length
+      page = parts[offset, limit] || []
+
+      {
+        :total => total,
+        :returned => page.length,
+        :offset => offset,
+        :limit => limit,
+        :parts => page.map { |part| _part_summary(part) }
+      }
+    end
+
+    def part_get_command(params)
+      p = _deep_symbolize(params || {})
+      part_id = p[:part_id].to_s
+      raise McpError.new('invalid_params', 'part_id is required.') if part_id.empty?
+
+      cutlist = _cutlist
+      part = _find_part(cutlist, part_id)
+      _part_detail(part)
+    end
+
+    def part_create_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      name = p[:name].to_s.strip
+      raise McpError.new('invalid_params', 'name is required.') if name.empty?
+
+      length = _positive_mm(p[:length_mm], 'length_mm')
+      width = _positive_mm(p[:width_mm], 'width_mm')
+      thickness = _positive_mm(p[:thickness_mm], 'thickness_mm')
+
+      position = p[:position_mm] || [ 0, 0, 0 ]
+      unless position.is_a?(Array) && position.length == 3
+        raise McpError.new('invalid_params', 'position_mm must be an array of 3 numbers.')
+      end
+
+      rotation = p[:rotation_deg] || [ 0, 0, 0 ]
+      unless rotation.is_a?(Array) && rotation.length == 3
+        raise McpError.new('invalid_params', 'rotation_deg must be an array of 3 numbers.')
+      end
+
+      count = (p[:count] || 1).to_i
+      raise McpError.new('invalid_params', "count must be between 1 and #{MAX_PART_COUNT}.") if count < 1 || count > MAX_PART_COUNT
+
+      spacing = (p[:spacing_mm] || 0).to_f
+      raise McpError.new('invalid_params', 'spacing_mm must be >= 0.') if spacing < 0
+
+      tags = Array(p[:tags]).map(&:to_s)
+
+      material = nil
+      if p[:material].is_a?(String) && !p[:material].strip.empty?
+        material_type = p[:material_type].nil? ? MaterialAttributes::TYPE_UNKNOWN : _material_type_to_int(p[:material_type])
+        color = p[:material_color] || _default_material_color(model)
+        material = MaterialAttributes.fetch_or_create_material(model, p[:material].strip, material_type, color)
+      end
+
+      warnings = []
+      warnings << 'count is greater than 1 and spacing_mm is 0: the copies overlap.' if count > 1 && spacing == 0
+
+      container_entities = _mcp_container_entities(model, p[:container_id])
+      created_entities = []
+
+      model.start_operation('OCL MCP: Create Part', true)
+      begin
+        definition = _mcp_create_box_definition(
+          model,
+          _mcp_unique_definition_name(model, name),
+          length.mm,
+          width.mm,
+          thickness.mm,
+          tags
+        )
+
+        count.times do |index|
+          copy_position = [ position[0].to_f + index * spacing, position[1].to_f, position[2].to_f ]
+          transformation = _mcp_instance_transformation(copy_position, rotation)
+          instance = container_entities.add_instance(definition, transformation)
+          raise McpError.new('create_failed', 'Failed to add the part instance.') if instance.nil?
+          instance.material = material unless material.nil?
+          created_entities << instance
+        end
+
+        unless model.commit_operation
+          raise McpError.new('create_failed', 'Failed to commit the part creation.')
+        end
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      entity_ids = created_entities.map { |entity| entity.entityID }
+      cutlist = _cutlist
+      part = _find_part_by_entity_ids(cutlist, entity_ids)
+
+      result = {
+        :created_entity_ids => entity_ids,
+        :warnings => warnings
+      }
+      if part.nil?
+        result[:warning] = 'The part was created but OpenCutList does not recognize it yet. Check its dimensions and visibility.'
+      else
+        result[:part] = _part_detail(part)
+      end
+      result
+    end
+
+    def part_update_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      part_id = p[:part_id].to_s
+      raise McpError.new('invalid_params', 'part_id is required.') if part_id.empty?
+
+      patch = p[:patch]
+      raise McpError.new('invalid_params', 'patch must be a non-empty object.') unless patch.is_a?(Hash) && !patch.empty?
+      patch = _deep_symbolize(patch)
+
+      allowed_keys = [
+        :name, :description, :url, :tags, :material,
+        :cumulable, :mass, :price, :thickness_layer_count,
+        :orientation_locked_on_axis, :symmetrical,
+        :ignore_grain_direction, :follow_grain_direction,
+        :edge_materials, :face_materials, :face_texture_angles
+      ]
+      unknown_keys = patch.keys - allowed_keys
+      raise McpError.new('invalid_params', "Unsupported patch keys: #{unknown_keys.join(', ')}.") unless unknown_keys.empty?
+
+      cutlist = _cutlist
+      part = _find_part(cutlist, part_id)
+
+      # Mirror what the UI does: send the part hash through JSON so nested hash
+      # keys become strings, exactly as CutlistPartUpdateWorker expects.
+      begin
+        part_hash = JSON.parse(JSON.generate(part.to_hash))
+      rescue JSON::GeneratorError
+        part_hash = _stringify_keys(part.to_hash)
+      end
+      warnings = []
+
+      # Name
+      if patch.key?(:name)
+        new_name = patch[:name].to_s
+        raise McpError.new('invalid_params', 'name cannot be empty.') if new_name.strip.empty?
+
+        if part.name_source == InstanceInfo::NAME_SOURCE_DEFINITION
+          part_hash['name'] = new_name
+        else
+          _rename_part_instances(model, part.entity_ids, new_name)
+          warnings << 'This part takes its name from the instance or dynamic attributes, so the instances were renamed directly.'
+        end
+      end
+
+      # Body material
+      if patch.key?(:material)
+        _validate_material_exists(model, patch[:material]) unless patch[:material].nil?
+        part_hash['material_name'] = patch[:material]
+      end
+
+      # Edge banding
+      if patch.key?(:edge_materials)
+        edge_materials = patch[:edge_materials] || {}
+        raise McpError.new('invalid_params', 'edge_materials must be an object.') unless edge_materials.is_a?(Hash)
+
+        names = part_hash['edge_material_names'].is_a?(Hash) ? part_hash['edge_material_names'] : {}
+        edge_materials.each do |edge, material_name|
+          edge_key = edge.to_s
+          unless %w(ymin ymax xmin xmax).include?(edge_key)
+            raise McpError.new('invalid_params', "Unknown edge '#{edge}'. Use ymin, ymax, xmin or xmax.")
+          end
+          _validate_material_type(model, material_name, MaterialAttributes::TYPE_EDGE) unless material_name.nil?
+          names[edge_key] = material_name
+        end
+        part_hash['edge_material_names'] = names
+
+        # Fill in the face entity ids by oriented axis so a brand-new part can
+        # receive edge banding even though OpenCutList has not detected edges yet.
+        existing_ids = part_hash['edge_entity_ids'].is_a?(Hash) ? part_hash['edge_entity_ids'] : {}
+        part_hash['edge_entity_ids'] = existing_ids.merge(_mcp_face_ids_by_role(model, part))
+      end
+
+      # Veneers / face materials
+      if patch.key?(:face_materials)
+        face_materials = patch[:face_materials] || {}
+        raise McpError.new('invalid_params', 'face_materials must be an object.') unless face_materials.is_a?(Hash)
+
+        names = part_hash['face_material_names'].is_a?(Hash) ? part_hash['face_material_names'] : {}
+        face_materials.each do |face, material_name|
+          face_key = face.to_s
+          unless %w(zmin zmax).include?(face_key)
+            raise McpError.new('invalid_params', "Unknown face '#{face}'. Use zmin or zmax.")
+          end
+          _validate_material_type(model, material_name, MaterialAttributes::TYPE_VENEER) unless material_name.nil?
+          names[face_key] = material_name
+        end
+        part_hash['face_material_names'] = names
+
+        existing_ids = part_hash['face_entity_ids'].is_a?(Hash) ? part_hash['face_entity_ids'] : {}
+        part_hash['face_entity_ids'] = existing_ids.merge(_mcp_face_ids_by_role(model, part))
+      end
+
+      if patch.key?(:face_texture_angles)
+        angles = patch[:face_texture_angles] || {}
+        raise McpError.new('invalid_params', 'face_texture_angles must be an object.') unless angles.is_a?(Hash)
+
+        current = part_hash['face_texture_angles'].is_a?(Hash) ? part_hash['face_texture_angles'] : {}
+        angles.each do |face, angle|
+          face_key = face.to_s
+          unless %w(zmin zmax).include?(face_key)
+            raise McpError.new('invalid_params', "Unknown face '#{face}'. Use zmin or zmax.")
+          end
+          current[face_key] = angle.nil? ? nil : angle.to_f.round
+        end
+        part_hash['face_texture_angles'] = current
+      end
+
+      # Scalar definition attributes
+      [ :description, :url, :tags, :cumulable, :mass, :price,
+        :thickness_layer_count, :orientation_locked_on_axis, :symmetrical,
+        :ignore_grain_direction, :follow_grain_direction ].each do |key|
+        part_hash[key.to_s] = patch[key] if patch.key?(key)
+      end
+
+      begin
+        committed = CutlistPartUpdateWorker.new(
+          cutlist,
+          parts_data: [ part_hash ],
+          transparent_operation: false
+        ).run
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      raise McpError.new('update_failed', 'OpenCutList failed to commit the part update.') unless committed == true
+
+      updated_cutlist = _cutlist
+      updated_part = _find_part_by_entity_ids(updated_cutlist, part.entity_ids)
+
+      {
+        :part_id => updated_part.nil? ? nil : updated_part.id,
+        :part => updated_part.nil? ? nil : _part_detail(updated_part),
+        :warnings => warnings
+      }
+    end
+
+    def part_resize_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      part_id = p[:part_id].to_s
+      raise McpError.new('invalid_params', 'part_id is required.') if part_id.empty?
+
+      targets_mm = {}
+      targets_mm[:length] = _positive_mm(p[:length_mm], 'length_mm') if p.key?(:length_mm)
+      targets_mm[:width] = _positive_mm(p[:width_mm], 'width_mm') if p.key?(:width_mm)
+      targets_mm[:thickness] = _positive_mm(p[:thickness_mm], 'thickness_mm') if p.key?(:thickness_mm)
+      raise McpError.new('invalid_params', 'Provide at least one of length_mm, width_mm or thickness_mm.') if targets_mm.empty?
+
+      cutlist = _cutlist
+      part = _find_part(cutlist, part_id)
+      raise McpError.new('unsupported_entity', 'Virtual parts (edge bands/veneers) cannot be resized directly. Edit the real part instead.') if part.virtual
+
+      entities = _resolve_entities(model, part.entity_ids)
+      raise McpError.new('part_not_found', 'None of the part instances could be resolved in the model.') if entities.empty?
+
+      model.start_operation('OCL MCP: Resize Part', true)
+      begin
+        scale_by_axis = _mcp_resize_entities(entities, part.def, targets_mm)
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      updated_cutlist = _cutlist
+      updated_part = _find_part_by_entity_ids(updated_cutlist, part.entity_ids)
+
+      {
+        :part_id => updated_part.nil? ? nil : updated_part.id,
+        :scale => scale_by_axis,
+        :part => updated_part.nil? ? nil : _part_detail(updated_part)
+      }
+    end
+
+    def part_move_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      part_id = p[:part_id].to_s
+      raise McpError.new('invalid_params', 'part_id is required.') if part_id.empty?
+
+      dx = (p[:dx_mm] || 0).to_f
+      dy = (p[:dy_mm] || 0).to_f
+      dz = (p[:dz_mm] || 0).to_f
+      raise McpError.new('invalid_params', 'Provide a non-zero dx_mm, dy_mm or dz_mm.') if dx == 0 && dy == 0 && dz == 0
+
+      cutlist = _cutlist
+      part = _find_part(cutlist, part_id)
+      raise McpError.new('unsupported_entity', 'Virtual parts (edge bands/veneers) cannot be moved directly. Move the real part instead.') if part.virtual
+
+      entities = _resolve_entities(model, part.entity_ids)
+      raise McpError.new('part_not_found', 'None of the part instances could be resolved in the model.') if entities.empty?
+
+      model.start_operation('OCL MCP: Move Part', true)
+      begin
+        _mcp_translate_entities(entities, dx, dy, dz)
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      bounds = Geom::BoundingBox.new
+      entities.each { |entity| bounds.add(entity.bounds) }
+
+      {
+        :part_id => part.id,
+        :bounds_mm => _mcp_bounds_mm(bounds)
+      }
+    end
+
+    def part_delete_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      part_id = p[:part_id].to_s
+      raise McpError.new('invalid_params', 'part_id is required.') if part_id.empty?
+      raise McpError.new('confirmation_required', 'Set confirm to true to delete a part.') unless p[:confirm] == true
+
+      cutlist = _cutlist
+      part = _find_part(cutlist, part_id)
+      raise McpError.new('unsupported_entity', 'Virtual parts (edge bands/veneers) disappear with their real part and cannot be deleted directly.') if part.virtual
+
+      entities = _resolve_entities(model, part.entity_ids)
+      raise McpError.new('part_not_found', 'None of the part instances could be resolved in the model.') if entities.empty?
+
+      erased = 0
+      model.start_operation('OCL MCP: Delete Part', true)
+      begin
+        erased = _mcp_erase_entities(entities)
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      {
+        :part_id => part.id,
+        :deleted_entity_count => erased
+      }
+    end
+
+    def parts_select_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      part_ids = Array(p[:part_ids]).map(&:to_s).reject(&:empty?)
+      raise McpError.new('invalid_params', 'part_ids must be a non-empty array.') if part_ids.empty?
+
+      mode = (p[:mode] || 'replace').to_s
+      unless %w(replace add remove).include?(mode)
+        raise McpError.new('invalid_params', "Unknown mode '#{mode}'. Use replace, add or remove.")
+      end
+
+      cutlist = _cutlist
+      parts = part_ids.map { |part_id| _find_part(cutlist, part_id) }
+      entities = parts.inject([]) { |memo, part| memo + _resolve_entities(model, part.entity_ids) }
+      raise McpError.new('part_not_found', 'None of the requested parts could be resolved in the model.') if entities.empty?
+
+      warnings = []
+      selectable = entities.select { |entity| model.active_entities.include?(entity) }
+      if selectable.length < entities.length
+        warnings << 'Some parts are nested inside a group and cannot be selected from the current drawing context.'
+      end
+
+      case mode
+      when 'replace'
+        model.selection.clear
+        model.selection.add(selectable) unless selectable.empty?
+      when 'add'
+        model.selection.add(selectable) unless selectable.empty?
+      when 'remove'
+        model.selection.remove(selectable) unless selectable.empty?
+      end
+
+      {
+        :mode => mode,
+        :selected_count => model.selection.length,
+        :requested_entity_count => entities.length,
+        :selectable_entity_count => selectable.length,
+        :warnings => warnings
+      }
+    end
+
+    # ---------------------------------------------------------------------
+    # Materials
+
+    def materials_list_command(params)
+      response = PLUGIN.execute_command('materials_list', {})
+      materials = Array(response[:materials]).map do |material|
+        {
+          :id => material[:id],
+          :name => material[:name],
+          :display_name => material[:display_name],
+          :color => material[:color],
+          :type => material[:type],
+          :type_name => MaterialAttributes.type_strippedname(material[:type]),
+          :thickness => material[:thickness],
+          :std_sizes => material[:std_sizes],
+          :std_thicknesses => material[:std_thicknesses],
+          :grained => material[:grained]
+        }
+      end
+
+      {
+        :count => materials.length,
+        :materials => materials,
+        :errors => response[:errors],
+        :warnings => response[:warnings]
+      }
+    end
+
+    def material_create_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      name = p[:name].to_s.strip
+      raise McpError.new('invalid_params', 'name is required.') if name.empty?
+
+      display_name = p[:display_name].to_s.strip
+      display_name = name if display_name.empty?
+      raise McpError.new('material_exists', "A material named '#{display_name}' already exists.") unless model.materials[display_name].nil?
+
+      type = p[:type].nil? ? MaterialAttributes::TYPE_UNKNOWN : _material_type_to_int(p[:type])
+      color = p[:color] || _default_material_color(model)
+
+      data = {
+        :name => name,
+        :display_name => display_name,
+        :color => color,
+        :type => type,
+        :transparent_operation => false
+      }
+      data[:thickness] = "#{p[:thickness_mm].to_f}mm" unless p[:thickness_mm].nil?
+
+      response = PLUGIN.execute_command('materials_create', data)
+      if response.is_a?(Hash) && response[:errors].is_a?(Array) && !response[:errors].empty?
+        raise McpError.new('material_create_failed', response[:errors].join(', '))
+      end
+
+      {
+        :name => display_name,
+        :requested_name => name,
+        :display_name => display_name,
+        :type => type,
+        :type_name => MaterialAttributes.type_strippedname(type),
+        :result => response
+      }
+    end
+
+    # ---------------------------------------------------------------------
+    # Cutlist
+
+    def cutlist_get_command(params)
+      p = _deep_symbolize(params || {})
+      include_parts = p[:include_parts] != false
+
+      cutlist = _cutlist
+      groups = cutlist.groups.map do |group|
+        parts = include_parts ? group.get_parts : []
+        {
+          :id => group.id,
+          :material_name => group.material_name,
+          :material_display_name => group.material_display_name,
+          :material_type => group.material_type_strippedname,
+          :material_is_virtual => group.material_is_virtual,
+          :part_count => group.part_count,
+          :total_cutting_length => group.total_cutting_length,
+          :total_cutting_area => group.total_cutting_area,
+          :total_cutting_volume => group.total_cutting_volume,
+          :parts => include_parts ? parts.map { |part| _part_summary(part) } : nil
+        }
+      end
+
+      {
+        :errors => cutlist.errors,
+        :warnings => cutlist.warnings,
+        :tips => cutlist.tips,
+        :groups => groups
+      }
+    end
+
+    # ---------------------------------------------------------------------
+    # Shared helpers
+
+    def _cutlist(options = {})
+      preset = PLUGIN.get_model_preset('cutlist_options') || {}
+      preset = _deep_symbolize(preset)
+
+      settings = {
+        :ignore_selection => true,
+        :scope => :model,
+        :names_filter => '',
+        :tags_filter => [],
+        :edge_material_names_filter => [],
+        :veneer_material_names_filter => []
+      }.merge(preset).merge(options)
+
+      CutlistGenerateWorker.new(**settings).run
+    end
+
+    def _require_model
+      model = Sketchup.active_model
+      raise McpError.new('no_model', 'No SketchUp model is open.') if model.nil?
+      model
+    end
+
+    def _find_part(cutlist, part_id)
+      part = cutlist.get_part(part_id)
+      if part.nil?
+        raise McpError.new('part_not_found', "No part with id '#{part_id}'. Call ocl_list_parts to get fresh ids.")
+      end
+      part
+    end
+
+    def _find_part_by_entity_ids(cutlist, entity_ids)
+      ids = Array(entity_ids).map(&:to_i)
+      return nil if ids.empty?
+      cutlist.get_parts.find { |part| (Array(part.entity_ids).map(&:to_i) & ids).any? }
+    end
+
+    def _resolve_entities(model, entity_ids)
+      Array(entity_ids).map { |entity_id| model.find_entity_by_id(entity_id.to_i) }.compact
+    end
+
+    def _rename_part_instances(model, entity_ids, name)
+      model.start_operation('OCL MCP: Rename Part', true)
+      begin
+        _resolve_entities(model, entity_ids).each do |entity|
+          entity.name = name if entity.respond_to?(:name=)
+        end
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+    end
+
+    def _part_summary(part)
+      size = part.def.size
+      cutting_size = part.def.cutting_size
+
+      {
+        :part_id => part.id,
+        :group_id => part.group.id,
+        :number => part.number,
+        :name => part.name,
+        :virtual => part.virtual,
+        :definition_id => part.respond_to?(:definition_id) ? part.definition_id : nil,
+        :length_mm => _mcp_mm(size.length),
+        :width_mm => _mcp_mm(size.width),
+        :thickness_mm => _mcp_mm(size.thickness),
+        :cutting_length_mm => _mcp_mm(cutting_size.length),
+        :cutting_width_mm => _mcp_mm(cutting_size.width),
+        :cutting_thickness_mm => _mcp_mm(cutting_size.thickness),
+        :count => part.count,
+        :material => part.group.material_name,
+        :material_type => part.group.material_type_strippedname,
+        :tags => part.tags,
+        :edge_materials => part.edge_material_names,
+        :face_materials => part.face_material_names,
+        :entity_ids => part.entity_ids
+      }
+    end
+
+    def _part_detail(part)
+      size = part.def.size
+      {
+        :summary => _part_summary(part),
+        :axes => size.axes.map { |axis| _mcp_axis_name(axis) },
+        :hash => part.to_hash
+      }
+    end
+
+    def _positive_mm(value, name)
+      number = value.to_f
+      raise McpError.new('invalid_params', "#{name} is required and must be > 0.") unless number > 0
+      raise McpError.new('invalid_params', "#{name} must be <= #{MAX_DIMENSION_MM.to_i} mm.") if number > MAX_DIMENSION_MM
+      number
+    end
+
+    def _material_type_to_int(value)
+      return value if value.is_a?(Integer) && value >= 0 && value <= 7
+      type = MATERIAL_TYPES[value.to_s.strip.downcase]
+      raise McpError.new('invalid_params', "Unknown material type '#{value}'.") if type.nil?
+      type
+    end
+
+    def _validate_material_exists(model, name)
+      return if name.nil?
+      raise McpError.new('material_not_found', "Material '#{name}' does not exist. Create it with ocl_create_material.") if model.materials[name].nil?
+    end
+
+    def _validate_material_type(model, name, expected_type)
+      return if name.nil?
+      material = model.materials[name]
+      raise McpError.new('material_not_found', "Material '#{name}' does not exist. Create it with ocl_create_material.") if material.nil?
+
+      actual_type = MaterialAttributes.new(material).type
+      return if actual_type == expected_type
+
+      raise McpError.new(
+        'invalid_material_type',
+        "Material '#{name}' has type '#{MaterialAttributes.type_strippedname(actual_type)}', expected '#{MaterialAttributes.type_strippedname(expected_type)}'."
+      )
+    end
+
+    def _default_material_color(model)
+      DEFAULT_MATERIAL_COLORS[model.materials.length % DEFAULT_MATERIAL_COLORS.length]
+    end
+
+    def _deep_symbolize(value)
+      case value
+      when Hash
+        value.each_with_object({}) { |(key, child), result| result[key.respond_to?(:to_sym) ? key.to_sym : key] = _deep_symbolize(child) }
+      when Array
+        value.map { |child| _deep_symbolize(child) }
+      else
+        value
+      end
+    end
+
+    def _stringify_keys(value)
+      case value
+      when Hash
+        value.each_with_object({}) { |(key, child), result| result[key.to_s] = _stringify_keys(child) }
+      when Array
+        value.map { |child| _stringify_keys(child) }
+      else
+        value
+      end
+    end
+
+    def _clamp(value, min, max)
+      [ [ value, min ].max, max ].min
+    end
+
+    def _version
+      defined?(EXTENSION_VERSION) ? EXTENSION_VERSION : 'unknown'
+    end
+
+    def _model_name
+      model = Sketchup.active_model
+      model.nil? ? nil : model.name
+    end
+
+    def _discovery_file
+      File.join(Dir.home, '.ocl-mcp', 'bridge.json')
+    end
+
+    def _length_unit_name(unit)
+      case unit
+      when 0 then 'inches'
+      when 1 then 'feet'
+      when 2 then 'millimeters'
+      when 3 then 'centimeters'
+      when 4 then 'meters'
+      when 5 then 'yards'
+      else 'unknown'
+      end
+    end
+
+  end
+
+end

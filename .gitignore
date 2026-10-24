@@ -18,9 +18,12 @@
 /build/node_modules/
 /build/cmake-build/
 /build/package-lock.json
+/mcp/node_modules/
 /Gemfile.lock
 /cmake-*
 /tools/python/*.dxf
 CLAUDE.md
 .claude
 .idea/
+
+.DS_Store

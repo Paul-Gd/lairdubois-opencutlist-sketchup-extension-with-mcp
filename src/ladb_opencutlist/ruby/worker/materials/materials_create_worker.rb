@@ -34,7 +34,9 @@ module Ladb::OpenCutList
                    texture_changed: false,
                    texture_rotation: nil,
                    texture_width: nil,
-                   texture_height: nil
+                   texture_height: nil,
+
+                   transparent_operation: true
 
     )
 
@@ -68,6 +70,8 @@ module Ladb::OpenCutList
       @std_prices = std_prices
       @std_cut_prices = std_cut_prices
 
+      @transparent_operation = transparent_operation
+
     end
 
     # -----
@@ -78,7 +82,7 @@ module Ladb::OpenCutList
       return { :errors => [ 'tab.materials.error.no_model' ] } unless model
 
       # Start a model modification operation
-      model.start_operation('OCL Material Create', true, false, true)
+      model.start_operation('OCL Material Create', true, false, @transparent_operation)
 
       materials = model.materials
       material = materials.add(@display_name)

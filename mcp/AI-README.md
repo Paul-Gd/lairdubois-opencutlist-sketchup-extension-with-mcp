@@ -1,0 +1,255 @@
+# AI implementation notes — OpenCutList MCP bridge
+
+Audience: AI agents and developers continuing this work.
+Verified on 2026-10-25 with SketchUp Pro 2023 (embedded Ruby 2.7.2), OpenCutList
+8.0.0, macOS, Node.js 24.
+
+This document explains **what was built, why it is shaped this way, and which
+invariants must not be broken**. Read it before changing the bridge.
+
+## What was built
+
+A loopback MCP bridge that lets AI tools view and edit OpenCutList parts in a
+running SketchUp model.
+
+```
+Claude Code / any MCP client
+   │  MCP over stdio (JSON-RPC)
+   ▼
+mcp/server.mjs  (Node 20+, @modelcontextprotocol/server 2.x, zod 4)
+   │  newline-delimited JSON over 127.0.0.1:<ephemeral port>
+   │  token from ~/.ocl-mcp/bridge.json (mode 0600)
+   ▼
+Ruby bridge inside the OpenCutList extension
+   │  timer-pumped non-blocking TCP on SketchUp's main thread
+   │  PLUGIN.execute_command / direct OCL workers
+   ▼
+OpenCutList model + workers → SketchUp model
+```
+
+The bridge is **off by default**. The user starts it from
+**Extensions → OpenCutList → MCP Bridge → Start MCP Bridge**.
+
+## Why this architecture
+
+- OpenCutList already has a generic command dispatcher
+  (`PLUGIN.register_command` / `PLUGIN.execute_command`, `plugin.rb:934-944`).
+  Reusing it means MCP operations behave like the UI instead of duplicating
+  model logic.
+- SketchUp's Ruby API is main-thread only. OCL's own `LocalHttpServer`
+  (`ruby/server/local_http_server.rb`) proves that a non-blocking `TCPServer`
+  pumped by a self-rescheduling `UI.start_timer` is safe. The bridge follows
+  that pattern and uses **no Ruby threads**.
+- MCP protocol work is delegated to the official SDK. The Node server is a thin,
+  debuggable adapter; the Ruby side only speaks a small newline-JSON protocol.
+- A separate stdio MCP server is more robust than implementing MCP Streamable
+  HTTP inside SketchUp's Ruby 2.7 runtime.
+
+## Files and responsibilities
+
+| Path | Responsibility |
+|---|---|
+| `src/ladb_opencutlist/ruby/mcp/mcp_bridge_server.rb` | TCP listener, discovery file, token auth, newline JSON framing, non-blocking pump, start/stop |
+| `src/ladb_opencutlist/ruby/mcp/mcp_controller.rb` | Registers `mcp_*` commands; parts/materials/cutlist handlers; undo wrapping |
+| `src/ladb_opencutlist/ruby/mcp/mcp_part_helper.rb` | Box creation, face-role mapping, resize/move/erase helpers, mm helpers |
+| `src/ladb_opencutlist/ruby/mcp/mcp_error.rb` | `McpError(code, message)` for structured bridge errors |
+| `src/ladb_opencutlist/ruby/plugin.rb` | Requires/pushes `McpController`; adds the MCP Bridge menu; stops the bridge |
+| `src/ladb_opencutlist/ruby/observer/app_observer.rb` | Stops the bridge on SketchUp quit |
+| `src/ladb_opencutlist/ruby/worker/cutlist/cutlist_generate_worker.rb` | Added `ignore_selection` and `scope: :model` (UI defaults unchanged) |
+| `src/ladb_opencutlist/ruby/worker/cutlist/cutlist_part_update_worker.rb` | Added `transparent_operation` (UI default unchanged; MCP passes false) |
+| `src/ladb_opencutlist/ruby/worker/materials/materials_create_worker.rb` | Same `transparent_operation` option |
+| `mcp/server.mjs` | MCP tool registration, schemas, descriptions, error results |
+| `mcp/bridge-client.mjs` | Discovery-file reader, TCP client, request serialization, timeouts, reconnects |
+| `mcp/README.md` | User-facing setup and tool documentation |
+| `.mcp.json` | Project-scoped Claude Code configuration |
+
+## Wire protocol
+
+Discovery file: `~/.ocl-mcp/bridge.json`, written with mode `0600` in a `0700`
+directory, deleted on stop/quit.
+
+```json
+{ "port": 50028, "token": "<64 hex chars>", "pid": 1234,
+  "version": "8.0.0", "model": "...", "started_at": "..." }
+```
+
+Framing: one UTF-8 JSON object per line (`\n`), max 8 MB per line.
+
+Request:
+
+```json
+{ "id": 1, "token": "...", "method": "mcp_parts_list", "params": {} }
+```
+
+Response:
+
+```json
+{ "id": 1, "ok": true, "result": { } }
+{ "id": 1, "ok": false, "error": { "code": "part_not_found", "message": "..." } }
+```
+
+`method` must be an exact registered `mcp_*` command. Unknown methods return
+`unknown_method`; a wrong token returns `auth_failed` and closes the connection.
+The Node client serializes calls (one in flight) because SketchUp's model state
+is single-threaded.
+
+## Tool → bridge command map
+
+| MCP tool | Bridge method | Type |
+|---|---|---|
+| `ocl_get_model_info` | `mcp_model_info` | read |
+| `ocl_list_parts` | `mcp_parts_list` | read |
+| `ocl_get_part` | `mcp_part_get` | read |
+| `ocl_get_cutlist` | `mcp_cutlist_get` | read |
+| `ocl_list_materials` | `mcp_materials_list` | read |
+| `ocl_create_part` | `mcp_part_create` | write |
+| `ocl_update_part` | `mcp_part_update` | write |
+| `ocl_resize_part` | `mcp_part_resize` | write |
+| `ocl_move_part` | `mcp_part_move` | write |
+| `ocl_delete_part` | `mcp_part_delete` | destructive |
+| `ocl_select_parts` | `mcp_parts_select` | write (selection) |
+| `ocl_create_material` | `mcp_material_create` | write |
+
+Bridge lifecycle commands (`mcp_bridge_start`, `mcp_bridge_stop`,
+`mcp_bridge_status`) and `mcp_ping` exist but are normally invoked from the
+SketchUp menu or a manual smoke test, not from the MCP client.
+
+## Critical invariants
+
+1. **Main thread only.** Never call SketchUp APIs from a Ruby thread. The bridge
+   is pumped by `UI.start_timer`; keep it that way.
+2. **No transparent operations from MCP.** The UI workers default to
+   `transparent_operation: true` so they merge into a UI-triggered operation.
+   MCP passes `false`; otherwise an AI call could merge into the user's previous
+   undo step (or a transparent operation could chain unpredictably).
+   MCP-created geometry uses its own `start_operation` and aborts on failure.
+3. **Model-scope cutlists.** `_cutlist` passes `scope: :model`,
+   `ignore_selection: true`, empty name/tag/material filters, and the user's
+   `cutlist_options` preset. This makes MCP see the whole model, not the current
+   selection, while still matching the UI's dimension/grouping settings.
+   The UI's defaults are unchanged.
+4. **Part IDs are not stable.** `Part#id` is an MD5 of definition UUID, name,
+   dimensions, etc. It changes after rename/resize/material/group changes.
+   After a mutation, re-find the part by `entity_ids` and return the new ID.
+   Tool descriptions tell the model to use the returned ID or re-list.
+5. **Feed the update worker a JSON-round-tripped hash.** The UI sends
+   `part.to_hash` through JSON, which turns nested symbol keys into strings.
+   `CutlistPartUpdateWorker` indexes with string keys (`'ymin'`, `'virtual'`,
+   ...). The controller does `JSON.parse(JSON.generate(part.to_hash))` for this
+   reason. Do not pass the raw Ruby hash.
+6. **Edge/face roles are geometric.** A newly created box has no
+   `edge_entity_ids` until OpenCutList detects edge materials. The controller
+   computes face entity IDs by comparing each definition face normal against
+   the part's oriented axes (`size.axes`): `xmin/xmax` are the length-axis
+   faces, `ymin/ymax` the width-axis faces, `zmin/zmax` the thickness-axis
+   faces. These IDs are merged into `edge_entity_ids` / `face_entity_ids` so
+   the update worker can apply edge/veneer materials in one pass.
+7. **Face orientation matters.** `Sketchup::Face#pushpull` always returns `nil`,
+   so it cannot be used as a success check. Creation verifies
+   `definition.bounds.depth`. The face is reversed unless its normal points up
+   (the same guard Smart Draw uses), and a bounds fallback lifts geometry above
+   z=0 if SketchUp's orientation heuristic produced a downward solid.
+8. **Units.** MCP inputs/outputs are millimetres; SketchUp stores inches
+   internally. Use `.mm` to build lengths and `.to_mm.to_f` to read them.
+9. **Creation scope.** New parts go to `model.entities` (model root), not the
+   active edit context, so they cannot accidentally modify a shared component
+   definition. `container_id` is allowed only for `Sketchup::Group`.
+10. **Materials.** `MaterialAttributes.fetch_or_create_material` never changes
+    an existing material's type. New materials default to unknown unless
+    `material_type` is supplied. Edge/face materials must already exist with
+    `TYPE_EDGE` / `TYPE_VENEER`; the controller validates this. OCL ignores
+    `thickness_mm` for sheet-good/solid-wood materials (their thickness comes
+    from app defaults); it is meaningful for edge/veneer materials.
+11. **Destructive operations.** Delete requires `confirm: true` and is one
+    SketchUp undo step. Virtual edge/veneer parts cannot be deleted, resized or
+    moved directly; operate on the real part.
+12. **Selection limits.** `model.selection` can only hold entities in the
+    current drawing context. `mcp_parts_select` selects root-level parts and
+    returns a warning for parts nested in closed groups.
+
+## What changed in the existing OpenCutList code
+
+- `plugin.rb`: requires and instantiates `McpController`, adds the MCP Bridge
+  submenu, adds `stop_mcp_bridge`.
+- `app_observer.rb`: stops the bridge in `onQuit`.
+- `cutlist_generate_worker.rb`: optional `ignore_selection` / `scope`.
+- `cutlist_part_update_worker.rb`, `materials_create_worker.rb`: optional
+  `transparent_operation` (defaults preserve UI behavior).
+- `dist/` and generated version constants were refreshed by `gulp build`.
+
+No existing UI route or default behavior was changed.
+
+## Build, install, test
+
+```bash
+# Ruby/RBZ (existing npm deps in build/ are enough)
+cd build && ./node_modules/.bin/gulp build
+# install dist/ladb_opencutlist.rbz via SketchUp Extension Manager, restart
+
+# Node MCP server
+cd mcp && npm install
+node --check server.mjs
+```
+
+Manual protocol smoke test with the bridge running:
+
+```bash
+PORT=$(jq -r .port ~/.ocl-mcp/bridge.json)
+TOKEN=$(jq -r .token ~/.ocl-mcp/bridge.json)
+printf '{"id":1,"token":"%s","method":"mcp_ping"}\n' "$TOKEN" | nc -w 2 127.0.0.1 "$PORT"
+printf '{"id":2,"token":"%s","method":"mcp_parts_list","params":{}}\n' "$TOKEN" | nc -w 2 127.0.0.1 "$PORT"
+```
+
+MCP Inspector:
+
+```bash
+cd mcp && npm run inspect
+```
+
+Live test sequence used on 2026-10-25 (all passed): create sheet + edge
+materials, create a 600×400×18 mm part, rename/tag/reassign material, apply
+2 mm edge banding on ymin/ymax (`edge_count: 2`, pattern `1010`), resize to
+800×400×18, move +100 mm (bounds z=100–118), select, delete, list → 0 parts.
+
+## Known limitations / future work
+
+- `ocl_create_part` creates rectangular boxes only. Smart Draw supports
+  rectangles, circles, polygons, arbitrary planes and construction geometry;
+  its creation path is coupled to interactive tool state
+  (`smart_draw_tool.rb:1544-1673`), so reusing it needs a dedicated worker.
+- No material update/delete MCP tool (create/list only). The UI can purge
+  unused materials.
+- No thumbnails, batch part update, grouping/outliner, export or packing tools.
+- Resize scales instance transformations; non-box geometry and textures stretch
+  like the SketchUp scale tool. Shared definitions scaled differently per
+  instance become separate OCL parts.
+- Multiple SketchUp instances starting the bridge overwrite the same discovery
+  file; the last start wins. The stop logic only deletes its own file (PID
+  check).
+- The bridge token lives for the bridge session; restarting the bridge rotates
+  it and the Node client re-reads the discovery file.
+- A timed-out mutation may still commit. Tell the model/client to re-list rather
+  than blindly retry.
+
+## Extending safely
+
+1. Add a command method in `McpController` and register it in `setup_commands`.
+2. Keep params JSON-friendly; deep-symbolize at the handler edge.
+3. Wrap every model mutation in `start_operation` / `commit_operation` /
+   `abort_operation`; raise `McpError` for expected failures.
+4. Add a tool in `mcp/server.mjs` with a zod schema, description, annotations
+   and timeout; map it to the `mcp_*` method.
+5. Add it to `mcp/README.md` and this file.
+6. Test the protocol standalone (stubbed Ruby server / fake TCP bridge) before
+   the live SketchUp test, then run the create → update → resize → move →
+   select → delete sequence on an empty model.
+
+## Security boundaries
+
+- Loopback only (`127.0.0.1`), ephemeral port.
+- Per-run random token required on every request; discovery file `0600`.
+- No arbitrary Ruby evaluation and no generic UI-command dispatch; only the
+  curated `mcp_*` commands are callable.
+- Delete requires explicit `confirm: true`; MCP annotations mark destructive
+  tools.
+- The bridge is opt-in via the SketchUp menu and stops on quit.

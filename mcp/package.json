@@ -1,0 +1,19 @@
+{
+  "name": "opencutlist-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server exposing OpenCutList parts to AI tools",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "inspect": "npx @modelcontextprotocol/inspector node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.4.0",
+    "zod": "^4.6.7"
+  }
+}

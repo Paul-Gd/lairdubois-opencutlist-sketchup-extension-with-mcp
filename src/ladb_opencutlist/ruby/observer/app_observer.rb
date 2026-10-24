@@ -111,6 +111,9 @@ module Ladb::OpenCutList
       # Stop local HTTP server used to serve dialog assets
       PLUGIN.stop_local_http_server
 
+      # Stop the MCP bridge and remove its discovery file
+      PLUGIN.stop_mcp_bridge
+
       # Trigger event to JS
       PLUGIN.trigger_event(ON_QUIT)
 

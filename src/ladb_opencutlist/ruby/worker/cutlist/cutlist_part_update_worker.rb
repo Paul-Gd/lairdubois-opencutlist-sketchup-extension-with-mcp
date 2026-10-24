@@ -43,13 +43,15 @@ module Ladb::OpenCutList
     def initialize(cutlist,
 
                    auto_orient: false,
-                   parts_data: []
+                   parts_data: [],
+                   transparent_operation: true
 
     )
 
       @cutlist = cutlist
 
       @auto_orient = auto_orient
+      @transparent_operation = transparent_operation
       @parts_data = parts_data.map { |part_data|
         PartData.new(
           part_data.fetch('virtual'),
@@ -95,7 +97,7 @@ module Ladb::OpenCutList
       return { :errors => [ 'tab.cutlist.error.no_model' ] } unless model
 
       # Start a model modification operation
-      model.start_operation('OCL Part Update', true, false, true)
+      model.start_operation('OCL Part Update', true, false, @transparent_operation)
 
       definitions = model.definitions
       @parts_data.each { |part_data|

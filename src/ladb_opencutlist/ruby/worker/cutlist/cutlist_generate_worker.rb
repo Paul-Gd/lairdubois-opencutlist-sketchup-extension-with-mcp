@@ -62,6 +62,10 @@ module Ladb::OpenCutList
                    active_entity: nil,
                    active_path: nil,
 
+                   # MCP bridge: scan the whole model and/or ignore the current selection
+                   ignore_selection: false,
+                   scope: :active,
+
                    # Unused but present for preset compatibility
                    hide_entity_names: nil,
                    hide_cutting_dimensions: nil,
@@ -103,6 +107,8 @@ module Ladb::OpenCutList
       # Retrieve active entity (if defined)
       @active_entity = active_entity
       @active_path = active_path
+      @ignore_selection = ignore_selection
+      @scope = scope
 
       # Setup caches
       @instance_infos_cache = {}
@@ -130,11 +136,22 @@ module Ladb::OpenCutList
 
         # Retrieve selected entities or all if no selection
         if model
-          path = model.active_path.to_a
-          if model.selection.empty?
+          if @scope == :model
+            # MCP bridge: always scan the whole model, whatever the current edit context
+            path = []
+            entities = model.entities
+            is_entity_selection = false
+          elsif @ignore_selection
+            # MCP bridge: keep the current edit context but ignore the selection
+            path = model.active_path.to_a
+            entities = model.active_entities
+            is_entity_selection = false
+          elsif model.selection.empty?
+            path = model.active_path.to_a
             entities = model.active_entities
             is_entity_selection = false
           else
+            path = model.active_path.to_a
             entities = model.selection
             is_entity_selection = true
           end

@@ -997,6 +997,10 @@ module Ladb::OpenCutList
       @local_http_server.stop unless @local_http_server.nil?
     end
 
+    def stop_mcp_bridge
+      (@controllers || []).each { |controller| controller.stop_bridge if controller.respond_to?(:stop_bridge) }
+    end
+
     # -----
 
     def setup
@@ -1061,6 +1065,30 @@ module Ladb::OpenCutList
 
       end
       submenu.add_separator
+
+      # Setup MCP Bridge menu
+      mcp_submenu = submenu.add_submenu('MCP Bridge')
+      mcp_submenu.add_item('Start MCP Bridge') {
+        result = execute_command('mcp_bridge_start')
+        if result.is_a?(Hash) && !result[:running] && result[:error]
+          UI.messagebox("MCP Bridge failed to start:\n#{result[:error]}")
+        end
+      }
+      mcp_submenu.add_item('Stop MCP Bridge') {
+        execute_command('mcp_bridge_stop')
+      }
+      mcp_submenu.add_item('MCP Bridge Status…') {
+        result = execute_command('mcp_bridge_status')
+        if result.is_a?(Hash)
+          if result[:running]
+            UI.messagebox("MCP Bridge is running on 127.0.0.1:#{result[:port]}.\nDiscovery file: #{result[:discovery_file]}")
+          else
+            UI.messagebox("MCP Bridge is stopped.\nDiscovery file: #{result[:discovery_file]}")
+          end
+        end
+      }
+      submenu.add_separator
+
       submenu.add_item(get_i18n_string('core.menu.item.reset_dialog_position')) {
         tabs_dialog_reset_position if _assert_not_zzz
       }
@@ -1157,6 +1185,7 @@ module Ladb::OpenCutList
         require_relative 'controller/importers_controller'
         require_relative 'controller/settings_controller'
         require_relative 'controller/hardware_controller'
+        require_relative 'controller/mcp_controller'
 
         @controllers.push(MaterialsController.new)
         @controllers.push(CutlistController.new)
@@ -1165,6 +1194,7 @@ module Ladb::OpenCutList
         @controllers.push(ImportersBxf2Controller.new)
         @controllers.push(SettingsController.new)
         @controllers.push(HardwareController.new)
+        @controllers.push(McpController.new)
 
         # -- Commands --
 
