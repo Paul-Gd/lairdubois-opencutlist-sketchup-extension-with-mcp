@@ -61,6 +61,8 @@ module Ladb::OpenCutList
       PLUGIN.register_command('mcp_part_move') { |params| part_move_command(params) }
       PLUGIN.register_command('mcp_part_delete') { |params| part_delete_command(params) }
       PLUGIN.register_command('mcp_parts_select') { |params| parts_select_command(params) }
+      PLUGIN.register_command('mcp_parts_visibility') { |params| parts_visibility_command(params) }
+      PLUGIN.register_command('mcp_screenshot') { |params| screenshot_command(params) }
 
       # Materials
       PLUGIN.register_command('mcp_materials_list') { |params| materials_list_command(params) }
@@ -502,13 +504,27 @@ module Ladb::OpenCutList
         raise e
       end
 
-      bounds = Geom::BoundingBox.new
-      entities.each { |entity| bounds.add(entity.bounds) }
+      updated_cutlist = _cutlist
+      updated_part = _find_part_by_entity_ids(updated_cutlist, part.entity_ids)
 
-      {
-        :part_id => part.id,
-        :bounds_mm => _mcp_bounds_mm(bounds)
-      }
+      if updated_part.nil?
+        # Fallback if the part vanished from the cutlist for any reason.
+        bounds = Geom::BoundingBox.new
+        entities.each { |entity| bounds.add(entity.bounds) }
+        {
+          :part_id => part.id,
+          :bounds_mm => _mcp_bounds_mm(bounds),
+          :instances => nil
+        }
+      else
+        {
+          :part_id => updated_part.id,
+          :bounds_mm => _mcp_part_world_bounds_mm(updated_part),
+          :instances => updated_part.def.instance_infos.values
+                                        .sort_by(&:serialized_path)
+                                        .map { |instance_info| _mcp_instance_world_info(instance_info) }
+        }
+      end
     end
 
     def part_delete_command(params)
@@ -586,6 +602,104 @@ module Ladb::OpenCutList
         :selectable_entity_count => selectable.length,
         :warnings => warnings
       }
+    end
+
+    def parts_visibility_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      visible = p[:visible]
+      raise McpError.new('invalid_params', 'visible must be true or false.') unless visible == true || visible == false
+
+      part_ids = Array(p[:part_ids]).map(&:to_s).reject(&:empty?)
+      entity_ids = Array(p[:entity_ids]).map { |entity_id| entity_id.to_i }.reject(&:zero?)
+      if part_ids.empty? && entity_ids.empty?
+        raise McpError.new('invalid_params', 'Provide part_ids or entity_ids.')
+      end
+
+      entities = _resolve_entities(model, entity_ids)
+
+      unless part_ids.empty?
+        # Hidden parts are excluded from the cutlist, so a hidden part can only
+        # be shown again through entity_ids (returned by the hide call).
+        cutlist = _cutlist
+        part_ids.each do |part_id|
+          begin
+            part = _find_part(cutlist, part_id)
+          rescue McpError => e
+            raise McpError.new(e.code, "#{e.message} If the part is hidden, pass the entity_ids returned by the hide call instead.")
+          end
+          entities.concat(_resolve_entities(model, part.entity_ids))
+        end
+      end
+
+      entities = entities.uniq { |entity| entity.entityID }
+      raise McpError.new('part_not_found', 'None of the requested entities could be resolved.') if entities.empty?
+
+      model.start_operation(visible ? 'OCL MCP: Show Parts' : 'OCL MCP: Hide Parts', true)
+      begin
+        changed = _mcp_set_entities_visible(entities, visible)
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      {
+        :visible => visible,
+        :changed_entity_count => changed,
+        :part_ids => part_ids,
+        :entity_ids => entities.map { |entity| entity.entityID },
+        :note => visible ? nil : 'Hidden parts are excluded from OpenCutList cutlists. Use the returned entity_ids to show them again.'
+      }
+    end
+
+    def screenshot_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+      view = model.active_view
+      raise McpError.new('no_view', 'No active SketchUp view is available.') if view.nil?
+
+      width = _clamp((p[:width] || 1200).to_i, 64, 4000)
+      height = _clamp((p[:height] || 800).to_i, 64, 4000)
+      isolate = p[:isolate] == true
+      zoom_extents = p[:zoom_extents] != false
+      part_ids = Array(p[:part_ids]).map(&:to_s).reject(&:empty?)
+
+      parts = []
+      paths = []
+
+      unless part_ids.empty?
+        cutlist = _cutlist
+        part_ids.each do |part_id|
+          part = _find_part(cutlist, part_id)
+          raise McpError.new('unsupported_entity', 'Virtual parts cannot be isolated in a screenshot.') if part.virtual
+          parts << part
+          paths.concat(part.def.instance_infos.values.map(&:path))
+        end
+      end
+
+      if isolate && paths.empty?
+        raise McpError.new('invalid_params', 'isolate requires at least one visible part_id.')
+      end
+
+      result = _mcp_capture_screenshot(
+        model,
+        view,
+        paths,
+        :width => width,
+        :height => height,
+        :isolate => isolate,
+        :zoom_extents => zoom_extents
+      )
+
+      result[:part_ids] = parts.map(&:id)
+      result[:isolated] = isolate
+      result
     end
 
     # ---------------------------------------------------------------------
@@ -749,6 +863,7 @@ module Ladb::OpenCutList
     def _part_summary(part)
       size = part.def.size
       cutting_size = part.def.cutting_size
+      instances = part.def.instance_infos.values.sort_by(&:serialized_path).map { |instance_info| _mcp_instance_world_info(instance_info) }
 
       {
         :part_id => part.id,
@@ -769,7 +884,10 @@ module Ladb::OpenCutList
         :tags => part.tags,
         :edge_materials => part.edge_material_names,
         :face_materials => part.face_material_names,
-        :entity_ids => part.entity_ids
+        :entity_ids => part.entity_ids,
+        :instance_count => instances.length,
+        :bounds_mm => _mcp_part_world_bounds_mm(part),
+        :instances => instances
       }
     end
 

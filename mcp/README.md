@@ -65,8 +65,43 @@ returned id or call `ocl_list_parts` again.
 | `ocl_resize_part` | write | Set absolute dimensions |
 | `ocl_move_part` | write | Translate all instances |
 | `ocl_select_parts` | write | Select parts in SketchUp |
+| `ocl_set_parts_visibility` | write | Hide or show parts |
+| `ocl_screenshot` | read | PNG of the viewport, optionally isolated to chosen parts |
 | `ocl_delete_part` | destructive | Delete all instances (requires `confirm: true`) |
 | `ocl_create_material` | write | Create a material, including edge/veneer types |
+
+### Coordinates
+
+All coordinates are **world-space millimetres**. Every part summary and detail
+includes:
+
+- `bounds_mm`: `{ "min": [x, y, z], "max": [x, y, z] }` — axis-aligned world
+  bounds, unioned over all instances of the part.
+- `instances[]`: one entry per placed instance, with:
+  - `position_mm` — the instance origin in world space (not the bbox min),
+  - `bounds_mm` — that instance's world bounds,
+  - `transformation` — the 16-number SketchUp transformation matrix,
+  - `path`, `serialized_path`, `entity_id`, `layer`, `flipped`.
+
+A part with several copies has several entries in `instances`; there is no
+single part-level point. `ocl_create_part`'s `position_mm` is interpreted in the
+container's coordinate system (model root by default); the returned instances
+give the resulting world coordinates.
+
+### Screenshots and visibility
+
+- `ocl_screenshot` returns a PNG image block of the current viewport. Pass
+  `part_ids` with `isolate: true` to show only those parts: everything else is
+  temporarily hidden (including siblings inside groups), the view zooms to the
+  selection, the image is captured, then visibility and camera are restored.
+  The temporary changes are aborted, so they do not appear on the undo stack.
+  Without `isolate`, the whole visible model is captured. Default size is
+  1200×800; dimensions are capped at 4000.
+- Screenshots use the current SketchUp style/background and are written under
+  the OpenCutList temp directory (`mcp_screenshots/`). The newest 20 are kept.
+- `ocl_set_parts_visibility` hides or shows parts as a normal undoable change.
+  **Hidden parts are excluded from OpenCutList cutlists**, so a hidden part can
+  only be shown again with the `entity_ids` returned by the hide call.
 
 ### Example prompts
 

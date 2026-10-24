@@ -108,6 +108,8 @@ is single-threaded.
 | `ocl_move_part` | `mcp_part_move` | write |
 | `ocl_delete_part` | `mcp_part_delete` | destructive |
 | `ocl_select_parts` | `mcp_parts_select` | write (selection) |
+| `ocl_set_parts_visibility` | `mcp_parts_visibility` | write (hide/show) |
+| `ocl_screenshot` | `mcp_screenshot` | view capture |
 | `ocl_create_material` | `mcp_material_create` | write |
 
 Bridge lifecycle commands (`mcp_bridge_start`, `mcp_bridge_stop`,
@@ -166,6 +168,31 @@ SketchUp menu or a manual smoke test, not from the MCP client.
 12. **Selection limits.** `model.selection` can only hold entities in the
     current drawing context. `mcp_parts_select` selects root-level parts and
     returns a warning for parts nested in closed groups.
+13. **World coordinates.** `_part_summary` includes `bounds_mm` (union of all
+    instance world bounds) and `instances[]`. Each instance uses
+    `InstanceInfo#transformation`, which is
+    `PathUtils.get_transformation(path)` (the full path transformation, not a
+    local one), so nested parts report true world coordinates.
+    `position_mm` is the instance origin, **not** the bounding-box minimum;
+    `bounds_mm` is the world AABB; `transformation` is the 16-number SketchUp
+    matrix. A part with several instances has no single position — callers must
+    use the `instances` array. `ocl_move_part` returns the same per-instance
+    data after the move.
+14. **Screenshots are temporary visibility changes.** `mcp_screenshot` calls
+    `View#write_image` (returns a Boolean). With `isolate`, it walks each
+    target instance path and hides every sibling at every parent collection,
+    keeps the ancestors/targets visible, zooms extents, captures, then restores
+    visibility and the camera in an `ensure`. The visibility changes are wrapped
+    in a normal operation that is **aborted**, so they never enter the undo
+    stack. Target parts must already be visible; a hidden target is not
+    unhidden. Locked entities may reject visibility changes. The PNG is written
+    under `PLUGIN.temp_dir/mcp_screenshots/` (newest 20 kept); the Node server
+    reads that file and returns it as an MCP image block.
+15. **Hiding is a real model change.** `mcp_parts_visibility` commits an
+    undoable operation. Hidden parts are excluded from OpenCutList cutlists, so
+    a hidden part cannot be found by `part_id`; the hide response returns
+    `entity_ids`, which the show call accepts instead. Hiding a part nested in
+    a shared component definition affects every instance of that definition.
 
 ## What changed in the existing OpenCutList code
 
@@ -209,7 +236,19 @@ cd mcp && npm run inspect
 Live test sequence used on 2026-10-25 (all passed): create sheet + edge
 materials, create a 600×400×18 mm part, rename/tag/reassign material, apply
 2 mm edge banding on ymin/ymax (`edge_count: 2`, pattern `1010`), resize to
-800×400×18, move +100 mm (bounds z=100–118), select, delete, list → 0 parts.
+800×400×18, move +100 mm (world bounds z=100–118), select, delete, list → 0
+parts. Part summaries/detail return world `bounds_mm` and per-instance
+`position_mm` / `transformation`.
+
+World-coordinate and visual tests (same session):
+
+- Two 600×400×18 parts created at `[0,0,0]` and `[1000,0,0]` reported
+  `bounds_mm` 0–600 and 1000–1600, positions `[0,0,0]` and `[1000,0,0]`, and
+  correct identity/translation matrices.
+- `mcp_screenshot` with `isolate` produced an 800×600 PNG containing only the
+  target part (2 sibling entities hidden), then restored visibility/camera.
+- `mcp_parts_visibility` hid the second part (cutlist went 2 → 1) and showing it
+  again via the returned `entity_ids` restored both parts (1 → 2).
 
 ## Known limitations / future work
 
@@ -219,7 +258,14 @@ materials, create a 600×400×18 mm part, rename/tag/reassign material, apply
   (`smart_draw_tool.rb:1544-1673`), so reusing it needs a dedicated worker.
 - No material update/delete MCP tool (create/list only). The UI can purge
   unused materials.
-- No thumbnails, batch part update, grouping/outliner, export or packing tools.
+- No part thumbnails (the viewport screenshot is the visual tool), batch part
+  update, grouping/outliner, export or packing tools.
+- Screenshot isolation only hides siblings along the target paths; it cannot
+  isolate inside a shared component definition without temporarily affecting
+  other instances of that definition (restored afterwards). Captures use the
+  current style/background and require a visible target part.
+- Hidden parts disappear from OpenCutList cutlists until shown again by
+  `entity_ids`.
 - Resize scales instance transformations; non-box geometry and textures stretch
   like the SketchUp scale tool. Shared definitions scaled differently per
   instance become separate OCL parts.

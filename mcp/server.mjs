@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod/v4';
@@ -121,6 +123,7 @@ function registerTools(server) {
   registerTool(server, 'ocl_list_parts', {
     description:
       'List OpenCutList parts from the whole model. Returns part_id, name, dimensions in millimetres, material, tags, count and entity ids. ' +
+      'Each part also has bounds_mm (world-space axis-aligned box) and instances[] with each instance world position_mm (its origin), bounds_mm and transformation matrix. ' +
       'part_id is valid for the current model state: call this again after any change to get fresh ids. Virtual edge/veneer parts are hidden unless include_virtual is true.',
     inputSchema: z.object({
       filters: z.object({
@@ -138,7 +141,7 @@ function registerTools(server) {
 
   registerTool(server, 'ocl_get_part', {
     description:
-      'Get the full details of one OpenCutList part by part_id: dimensions in mm, oriented axes, edge/face materials and the raw OpenCutList data.',
+      'Get the full details of one OpenCutList part by part_id: dimensions in mm, oriented axes, edge/face materials, world bounds, per-instance positions/transformations and the raw OpenCutList data.',
     inputSchema: z.object({
       part_id: z.string().min(1)
     }),
@@ -167,7 +170,7 @@ function registerTools(server) {
     description:
       'Create one or more rectangular parts in the model and register them with OpenCutList. All dimensions and positions are in millimetres. ' +
       'The part definition is created at the model root unless container_id names a group. Use rotation_deg to stand a panel upright (e.g. [0,90,0]). ' +
-      'Returns the new part with a fresh part_id.',
+      'Returns the new part with a fresh part_id, world bounds and per-instance world positions in millimetres.',
     inputSchema: z.object({
       name: z.string().min(1).describe('Definition/part name, e.g. "Shelf".'),
       length_mm: z.number().positive().max(100000),
@@ -208,7 +211,7 @@ function registerTools(server) {
   }, 'mcp_part_resize', { timeoutMs: 120000 });
 
   registerTool(server, 'ocl_move_part', {
-    description: 'Translate all instances of a part by a relative offset in millimetres. Returns the new world bounding box.',
+    description: 'Translate all instances of a part by a relative offset in millimetres. Returns the new world bounding box and each instance world position.',
     inputSchema: moveSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_part_move', { timeoutMs: 60000 });
@@ -233,6 +236,51 @@ function registerTools(server) {
     }),
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_parts_select', { timeoutMs: 60000 });
+
+  registerTool(server, 'ocl_set_parts_visibility', {
+    description:
+      'Hide or show parts. Hidden parts are excluded from OpenCutList cutlists, so to show a hidden part pass the entity_ids returned by the hide call ' +
+      '(part_ids cannot be resolved while the part is hidden). Changes are one undoable SketchUp operation.',
+    inputSchema: z.object({
+      part_ids: z.array(z.string().min(1)).optional(),
+      entity_ids: z.array(z.number().int()).optional(),
+      visible: z.boolean()
+    }).refine((value) => (value.part_ids?.length ?? 0) > 0 || (value.entity_ids?.length ?? 0) > 0, {
+      message: 'Provide part_ids or entity_ids.'
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  }, 'mcp_parts_visibility', { timeoutMs: 60000 });
+
+  server.registerTool('ocl_screenshot', {
+    description:
+      'Capture a PNG image of the current SketchUp viewport. With part_ids + isolate: true, temporarily hides everything that is not on those parts, ' +
+      'zooms to them, captures the image, then restores visibility and camera; the temporary changes do not stay on the undo stack. ' +
+      'Without isolate, the whole visible model is captured. Returns an image block plus metadata (path, size, hidden entity count). ' +
+      'Recommended size 1200×800; both dimensions are capped at 4000.',
+    inputSchema: z.object({
+      part_ids: z.array(z.string().min(1)).optional(),
+      isolate: z.boolean().optional(),
+      width: z.number().int().min(64).max(4000).optional(),
+      height: z.number().int().min(64).max(4000).optional(),
+      zoom_extents: z.boolean().optional()
+    }).refine((value) => !value.isolate || (Array.isArray(value.part_ids) && value.part_ids.length > 0), {
+      message: 'isolate requires part_ids.'
+    }),
+    annotations: { readOnlyHint: true, openWorldHint: false }
+  }, async (args) => {
+    try {
+      const result = await bridge.call('mcp_screenshot', args || {}, { timeoutMs: 120000 });
+      const image = await fs.promises.readFile(result.path);
+      return {
+        content: [
+          { type: 'text', text: JSON.stringify(result, null, 2) },
+          { type: 'image', data: image.toString('base64'), mimeType: 'image/png' }
+        ]
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
 
   registerTool(server, 'ocl_create_material', {
     description:
