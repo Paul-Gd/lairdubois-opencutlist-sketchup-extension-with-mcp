@@ -2,7 +2,7 @@ module Ladb::OpenCutList
 
     EXTENSION_NAME = 'OpenCutList'.freeze
     EXTENSION_VERSION = '8.0.0'.freeze
-    EXTENSION_BUILD = '202610242125'.freeze
+    EXTENSION_BUILD = '202610242151'.freeze
 
     DEFAULT_LANGUAGE = 'en'
     ENABLED_LANGUAGES = %w[ar cs de en es fr hu it nl pl pt ro ru sr uk vi zh]

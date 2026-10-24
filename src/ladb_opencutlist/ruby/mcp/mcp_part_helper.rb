@@ -167,14 +167,17 @@ module Ladb::OpenCutList
     # InstanceInfo#transformation is the full path transformation (the part may
     # be nested in groups), so its origin and the transformed definition bounds
     # are real world coordinates.
-    def _mcp_instance_world_info(instance_info)
+    def _mcp_instance_world_info(instance_info, part_axes = nil)
       entity = instance_info.entity
       transformation = instance_info.transformation
 
-      definition_bounds = instance_info.definition_bounds
-      if definition_bounds.nil? && instance_info.definition
-        definition_bounds = instance_info.definition.bounds
-      end
+      # Hardware parts store parent/world-space entity.bounds in
+      # InstanceInfo#definition_bounds (cutlist_generate_worker.rb:1157),
+      # while normal parts store definition-local bounds. definition.bounds is
+      # always definition-local, so prefer it and never transform a
+      # world-space box twice.
+      definition = instance_info.definition
+      definition_bounds = definition.nil? ? instance_info.definition_bounds : definition.bounds
 
       bounds_mm = nil
       unless definition_bounds.nil?
@@ -184,6 +187,7 @@ module Ladb::OpenCutList
       end
 
       layer = instance_info.layer
+      roles = _mcp_role_world_info(part_axes, transformation)
       {
         :entity_id => entity.respond_to?(:entityID) ? entity.entityID : nil,
         :path => instance_info.named_path,
@@ -193,8 +197,52 @@ module Ladb::OpenCutList
         :transformation => transformation.to_a,
         :layer => layer.respond_to?(:name) ? layer.name : nil,
         :flipped => instance_info.flipped,
-        :visible => entity.respond_to?(:visible?) ? entity.visible? : nil
+        :visible => entity.respond_to?(:visible?) ? entity.visible? : nil,
+        :edge_roles => roles.nil? ? nil : roles.select { |role, _| %w(xmin xmax ymin ymax).include?(role) },
+        :face_roles => roles.nil? ? nil : roles.select { |role, _| %w(zmin zmax).include?(role) }
       }
+    end
+
+    # World-space direction of each oriented edge/face role for one instance.
+    # Labels use SketchUp's world directions: front = -Y, back = +Y,
+    # left = -X, right = +X, bottom = -Z, top = +Z.
+    def _mcp_role_world_info(part_axes, transformation)
+      return nil if part_axes.nil? || part_axes.length < 3
+
+      length_axis, width_axis, thickness_axis = part_axes
+      local_axes = {
+        'xmin' => [ length_axis.reverse, 'x', '-' ],
+        'xmax' => [ length_axis, 'x', '+' ],
+        'ymin' => [ width_axis.reverse, 'y', '-' ],
+        'ymax' => [ width_axis, 'y', '+' ],
+        'zmin' => [ thickness_axis.reverse, 'z', '-' ],
+        'zmax' => [ thickness_axis, 'z', '+' ]
+      }
+
+      local_axes.each_with_object({}) do |(role, (axis, axis_name, sign)), result|
+        world = axis.transform(transformation)
+        length = world.length
+        world = Geom::Vector3d.new(world.x / length, world.y / length, world.z / length) if length > 0
+
+        result[role] = {
+          :local_axis => axis_name,
+          :sign => sign,
+          :world_normal => [ world.x.round(3), world.y.round(3), world.z.round(3) ],
+          :label => _mcp_world_direction_label(world)
+        }
+      end
+    end
+
+    def _mcp_world_direction_label(vector)
+      axis, value = { 'x' => vector.x, 'y' => vector.y, 'z' => vector.z }.max_by { |_, component| component.abs }
+      case axis
+      when 'x'
+        value >= 0 ? 'right' : 'left'
+      when 'y'
+        value >= 0 ? 'back' : 'front'
+      else
+        value >= 0 ? 'top' : 'bottom'
+      end
     end
 
     # Union of all instance world bounds for a part, in millimetres.
@@ -203,10 +251,10 @@ module Ladb::OpenCutList
       found = false
 
       part.def.instance_infos.values.each do |instance_info|
-        definition_bounds = instance_info.definition_bounds
-        if definition_bounds.nil? && instance_info.definition
-          definition_bounds = instance_info.definition.bounds
-        end
+        # See _mcp_instance_world_info: definition.bounds is always local,
+        # whereas InstanceInfo#definition_bounds is world-space for hardware.
+        definition = instance_info.definition
+        definition_bounds = definition.nil? ? instance_info.definition_bounds : definition.bounds
         next if definition_bounds.nil?
 
         transformation = instance_info.transformation

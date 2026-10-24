@@ -111,6 +111,8 @@ is single-threaded.
 | `ocl_set_parts_visibility` | `mcp_parts_visibility` | write (hide/show) |
 | `ocl_screenshot` | `mcp_screenshot` | view capture |
 | `ocl_create_material` | `mcp_material_create` | write |
+| `ocl_update_material` | `mcp_material_update` | write |
+| `ocl_delete_material` | `mcp_material_delete` | destructive |
 
 Bridge lifecycle commands (`mcp_bridge_start`, `mcp_bridge_stop`,
 `mcp_bridge_status`) and `mcp_ping` exist but are normally invoked from the
@@ -193,6 +195,32 @@ SketchUp menu or a manual smoke test, not from the MCP client.
     a hidden part cannot be found by `part_id`; the hide response returns
     `entity_ids`, which the show call accepts instead. Hiding a part nested in
     a shared component definition affects every instance of that definition.
+16. **Hardware bounds are a special case.** For hardware materials,
+    `cutlist_generate_worker.rb:1157` stores parent/world-space `entity.bounds`
+    in `InstanceInfo#definition_bounds`; normal parts store definition-local
+    bounds. Never transform `definition_bounds` directly in MCP code. Prefer
+    `instance_info.definition.bounds`, which is always definition-local, and
+    fall back to `definition_bounds` only when the definition is nil
+    (`_mcp_instance_world_info`, `_mcp_part_world_bounds_mm`).
+17. **Materials are patchable.** `MaterialsUpdateWorker` writes every
+    attribute, so `material_update_command` first builds the full current
+    attribute hash and then overlays the patch. `transparent_operation: false`
+    gives the MCP call its own undo step. Deletion is wrapped in an operation in
+    the controller and refuses in-use materials unless `force: true`.
+18. **MCP type names are normalized.** OCL's `type_strippedname` returns the
+    historical `unknow`; the controller maps it to `unknown` in every response
+    (`_material_type_name`). Inputs already accept both spellings.
+19. **Edge roles are exposed per instance.** `_mcp_role_world_info` transforms
+    each oriented definition axis by the instance's full path transformation
+    and labels the dominant world direction (`front` = -Y, `back` = +Y,
+    `left` = -X, `right` = +X, `top` = +Z, `bottom` = -Z). Use
+    `instances[].edge_roles` / `face_roles` instead of assuming `ymin` is the
+    front edge; `edge_material_colors` is a display colour, while
+    `edge_material_raw_colors` / `face_material_raw_colors` are the real
+    material colours.
+20. **Zero move is allowed.** `ocl_move_part` with a zero offset performs no
+    operation but returns the current world bounds and instance positions; it is
+    the cheapest "where is this part?" query.
 
 ## What changed in the existing OpenCutList code
 
@@ -200,8 +228,9 @@ SketchUp menu or a manual smoke test, not from the MCP client.
   submenu, adds `stop_mcp_bridge`.
 - `app_observer.rb`: stops the bridge in `onQuit`.
 - `cutlist_generate_worker.rb`: optional `ignore_selection` / `scope`.
-- `cutlist_part_update_worker.rb`, `materials_create_worker.rb`: optional
-  `transparent_operation` (defaults preserve UI behavior).
+- `cutlist_part_update_worker.rb`, `materials_create_worker.rb`,
+  `materials_update_worker.rb`: optional `transparent_operation` (defaults
+  preserve UI behavior).
 - `dist/` and generated version constants were refreshed by `gulp build`.
 
 No existing UI route or default behavior was changed.
@@ -249,6 +278,22 @@ World-coordinate and visual tests (same session):
   target part (2 sibling entities hidden), then restored visibility/camera.
 - `mcp_parts_visibility` hid the second part (cutlist went 2 → 1) and showing it
   again via the returned `entity_ids` restored both parts (1 → 2).
+
+Feedback regression tests (2026-10-25, feedback round 1):
+
+- Hardware rail 756×25×25 at `[18,265,1630]`: `bounds_mm` is
+  `[18,265,1630]..[774,290,1655]` at creation and after `ocl_update_part` (no
+  double translation). `edge_roles` are correct.
+- `ocl_update_material` changed colour/description/type and preserved the name;
+  `ocl_delete_material` deleted an unused material, refused an in-use one, and
+  succeeded after the part was deleted.
+- Auto-created material warning reported type `unknown` and colour; a raw
+  bridge call with `create_material_if_missing: false` returned
+  `material_not_found` and created nothing.
+- Zero-offset `ocl_move_part` returned the current bounds/positions without an
+  undo step.
+- Rotated part `[0,90,0]`: bounds `z=-600..0`, `xmin` label `top`, `xmax`
+  `bottom`, `zmin` `left`, `zmax` `right` — matching the documented table.
 
 ## Known limitations / future work
 

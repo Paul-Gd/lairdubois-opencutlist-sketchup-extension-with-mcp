@@ -85,8 +85,8 @@ const updatePatchSchema = z.object({
   symmetrical: z.boolean().optional(),
   ignore_grain_direction: z.boolean().optional(),
   follow_grain_direction: z.boolean().optional(),
-  edge_materials: z.object(optionalEdgeMaterials).optional().describe('Edge-band material by edge: ymin, ymax, xmin, xmax. null clears an edge.'),
-  face_materials: z.object(optionalFaceMaterials).optional().describe('Veneer material by face: zmin, zmax. null clears a face.'),
+  edge_materials: z.object(optionalEdgeMaterials).optional().describe('Edge-band material by definition-local edge role: ymin, ymax, xmin, xmax. These are NOT world directions; read instances[].edge_roles for the world label/normal of each role. null clears an edge.'),
+  face_materials: z.object(optionalFaceMaterials).optional().describe('Veneer material by definition-local face role: zmin, zmax. Read instances[].face_roles for world labels. null clears a face.'),
   face_texture_angles: z.object(optionalFaceAngles).optional().describe('Veneer texture angle in degrees by face: zmin, zmax.')
 }).refine((patch) => Object.keys(patch).length > 0, {
   message: 'Provide at least one field to update.'
@@ -106,8 +106,6 @@ const moveSchema = z.object({
   dx_mm: z.number().optional(),
   dy_mm: z.number().optional(),
   dz_mm: z.number().optional()
-}).refine((value) => (value.dx_mm ?? 0) !== 0 || (value.dy_mm ?? 0) !== 0 || (value.dz_mm ?? 0) !== 0, {
-  message: 'Provide a non-zero offset.'
 });
 
 function registerTools(server) {
@@ -123,7 +121,8 @@ function registerTools(server) {
   registerTool(server, 'ocl_list_parts', {
     description:
       'List OpenCutList parts from the whole model. Returns part_id, name, dimensions in millimetres, material, tags, count and entity ids. ' +
-      'Each part also has bounds_mm (world-space axis-aligned box) and instances[] with each instance world position_mm (its origin), bounds_mm and transformation matrix. ' +
+      'Each part also has bounds_mm (world-space axis-aligned box) and instances[] with each instance world position_mm (its origin), bounds_mm, transformation matrix, ' +
+      'visible flag, edge_roles and face_roles. Role entries include the definition-local axis/sign, the world normal and a world label (front/back/left/right/top/bottom). ' +
       'part_id is valid for the current model state: call this again after any change to get fresh ids. Virtual edge/veneer parts are hidden unless include_virtual is true.',
     inputSchema: z.object({
       filters: z.object({
@@ -141,7 +140,8 @@ function registerTools(server) {
 
   registerTool(server, 'ocl_get_part', {
     description:
-      'Get the full details of one OpenCutList part by part_id: dimensions in mm, oriented axes, edge/face materials, world bounds, per-instance positions/transformations and the raw OpenCutList data.',
+      'Get the full details of one OpenCutList part by part_id: dimensions in mm, oriented axes, edge/face materials, world bounds, per-instance positions/transformations, ' +
+      'edge_roles/face_roles (local axis + world normal + front/back/left/right/top/bottom label), raw material colours and the raw OpenCutList data.',
     inputSchema: z.object({
       part_id: z.string().min(1)
     }),
@@ -169,8 +169,11 @@ function registerTools(server) {
   registerTool(server, 'ocl_create_part', {
     description:
       'Create one or more rectangular parts in the model and register them with OpenCutList. All dimensions and positions are in millimetres. ' +
-      'The part definition is created at the model root unless container_id names a group. Use rotation_deg to stand a panel upright (e.g. [0,90,0]). ' +
-      'Returns the new part with a fresh part_id, world bounds and per-instance world positions in millimetres.',
+      'The part definition is created at the model root unless container_id names a group. position_mm is the transformed local origin, not the bbox minimum. ' +
+      'Rotations compose T(position) * Rx * Ry * Rz: with [0,90,0] local length maps to world -Z (the part extends downward), with [0,-90,0] to world +Z, ' +
+      'and with [90,0,0] local width maps to world +Z. Use rotation_deg [0,90,0] plus position z=height to stand a panel upright on the floor. ' +
+      'Returns the new part with a fresh part_id, world bounds and per-instance world positions in millimetres. ' +
+      'If the material does not exist it is created (type unknown unless material_type is given); set create_material_if_missing: false to fail instead.',
     inputSchema: z.object({
       name: z.string().min(1).describe('Definition/part name, e.g. "Shelf".'),
       length_mm: z.number().positive().max(100000),
@@ -183,6 +186,7 @@ function registerTools(server) {
       material: z.string().optional().describe('Material name; created if it does not exist.'),
       material_type: z.enum(MATERIAL_TYPES).optional(),
       material_color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().describe('Colour for a newly created material, e.g. "#C8A165".'),
+      create_material_if_missing: z.boolean().optional().describe('When false, fail if the material does not exist instead of creating it. Defaults to true.'),
       tags: z.array(z.string()).optional(),
       container_id: z.number().int().optional().describe('Optional entityID of a group to create the part inside. Components are rejected.')
     }),
@@ -211,7 +215,7 @@ function registerTools(server) {
   }, 'mcp_part_resize', { timeoutMs: 120000 });
 
   registerTool(server, 'ocl_move_part', {
-    description: 'Translate all instances of a part by a relative offset in millimetres. Returns the new world bounding box and each instance world position.',
+    description: 'Translate all instances of a part by a relative offset in millimetres. A zero offset is allowed and returns the current world bounds and instance positions without changing the model.',
     inputSchema: moveSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_part_move', { timeoutMs: 60000 });
@@ -295,6 +299,57 @@ function registerTools(server) {
     }),
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_material_create', { timeoutMs: 60000 });
+
+  registerTool(server, 'ocl_update_material', {
+    description:
+      'Update an existing material by name. Only the supplied fields change: colour, type, display name (rename), description, url, thickness and standard sizes/prices. ' +
+      'thickness_mm is meaningful for edge/veneer materials; OpenCutList uses app defaults for sheet goods/solid wood. ' +
+      'The returned name is the actual material name (SketchUp may uniquify a rename).',
+    inputSchema: z.object({
+      name: z.string().min(1),
+      patch: z.object({
+        display_name: z.string().min(1).optional(),
+        color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+        type: z.enum(MATERIAL_TYPES).optional(),
+        thickness_mm: z.number().positive().max(100000).optional(),
+        thickness: z.string().optional().describe('Formatted thickness with units, e.g. "2mm".'),
+        description: z.string().optional(),
+        url: z.string().optional(),
+        length_increase_mm: z.number().nonnegative().optional(),
+        width_increase_mm: z.number().nonnegative().optional(),
+        thickness_increase_mm: z.number().nonnegative().optional(),
+        length_increase: z.string().optional(),
+        width_increase: z.string().optional(),
+        thickness_increase: z.string().optional(),
+        std_sections: z.string().optional(),
+        std_lengths: z.string().optional(),
+        std_widths: z.string().optional(),
+        std_thicknesses: z.string().optional(),
+        std_sizes: z.string().optional(),
+        grained: z.boolean().optional(),
+        edge_decremented: z.boolean().optional(),
+        raw_estimated: z.boolean().optional(),
+        multiplier_coefficient: z.number().optional(),
+        std_volumic_masses: z.string().optional(),
+        std_prices: z.string().optional(),
+        std_cut_prices: z.string().optional()
+      }).refine((value) => Object.keys(value).length > 0, {
+        message: 'Provide at least one field to update.'
+      })
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  }, 'mcp_material_update', { timeoutMs: 60000 });
+
+  registerTool(server, 'ocl_delete_material', {
+    description:
+      'Delete a material by name. If the material is used by OpenCutList parts the call fails unless force: true is set; ' +
+      'a forced deletion may leave material references on entities empty. This is destructive and undoable.',
+    inputSchema: z.object({
+      name: z.string().min(1),
+      force: z.boolean().optional()
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false }
+  }, 'mcp_material_delete', { timeoutMs: 60000 });
 }
 
 serveStdio(() => {

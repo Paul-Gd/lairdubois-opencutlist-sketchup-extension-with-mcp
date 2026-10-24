@@ -69,6 +69,8 @@ returned id or call `ocl_list_parts` again.
 | `ocl_screenshot` | read | PNG of the viewport, optionally isolated to chosen parts |
 | `ocl_delete_part` | destructive | Delete all instances (requires `confirm: true`) |
 | `ocl_create_material` | write | Create a material, including edge/veneer types |
+| `ocl_update_material` | write | Change colour, type, thickness, display name, etc. |
+| `ocl_delete_material` | destructive | Delete an unused material (force optional) |
 
 ### Coordinates
 
@@ -81,12 +83,59 @@ includes:
   - `position_mm` — the instance origin in world space (not the bbox min),
   - `bounds_mm` — that instance's world bounds,
   - `transformation` — the 16-number SketchUp transformation matrix,
-  - `path`, `serialized_path`, `entity_id`, `layer`, `flipped`.
+  - `path`, `serialized_path`, `entity_id`, `layer`, `flipped`, `visible`,
+  - `edge_roles` / `face_roles` — for each `xmin/xmax/ymin/ymax/zmin/zmax`, the
+    definition-local axis and sign, the normalized world normal and a world
+    label (`front` = -Y, `back` = +Y, `left` = -X, `right` = +X, `top` = +Z,
+    `bottom` = -Z).
 
 A part with several copies has several entries in `instances`; there is no
 single part-level point. `ocl_create_part`'s `position_mm` is interpreted in the
 container's coordinate system (model root by default); the returned instances
 give the resulting world coordinates.
+
+#### Rotation and position semantics
+
+`position_mm` is the transformed **local origin**, not the min corner of the
+world bounding box. Rotations compose as `T(position) * Rx * Ry * Rz`, so the
+local axes map to world directions as follows:
+
+| `rotation_deg` | local length (X) | local width (Y) | local thickness (Z) |
+|---|---|---|---|
+| `[0, 0, 0]` | world +X | world +Y | world +Z |
+| `[0, 90, 0]` | world -Z (extends downward) | world +Y | world +X |
+| `[90, 0, 0]` | world +X | world +Z | world -Y |
+| `[0, -90, 0]` | world +Z (extends upward) | world +Y | world -X |
+
+To stand a 1760 mm panel on the floor with `[0, 90, 0]`, pass
+`position_mm: [x, y, 1760]`; with `[0, -90, 0]`, use `z = 0`. Always confirm
+with the returned `bounds_mm`.
+
+#### Material semantics
+
+- `ocl_create_part` creates a missing material automatically and reports it in
+  `warnings`; set `create_material_if_missing: false` to fail instead.
+- `ocl_update_material` patches only the supplied fields. `display_name` renames
+  the material (SketchUp may uniquify it).
+- `ocl_delete_material` refuses materials used by OpenCutList parts unless
+  `force: true`.
+- `thickness_mm` is only meaningful for `edge` / `veneer` materials; for sheet
+  goods and solid wood, OpenCutList uses the type's app-default thickness.
+- `type_name` is normalized to `unknown` (OCL's historical spelling is
+  `unknow`).
+
+#### Edge banding keys
+
+`edge_materials` keys (`ymin`, `ymax`, `xmin`, `xmax`) index the part's
+**definition-local oriented axes**, not world directions. Which physical edge
+that is depends on `rotation_deg`; read `instances[].edge_roles` to get the
+world label and normal for each key. `edge_material_colors` in the raw
+OpenCutList data is a display colour (near-white edge materials are darkened so
+they stay visible); `ocl_get_part` also returns
+`edge_material_raw_colors` / `face_material_raw_colors`.
+
+`ocl_resize_part` returns a fresh `part_id`, like `ocl_update_part`; use the
+returned id for later calls.
 
 ### Screenshots and visibility
 

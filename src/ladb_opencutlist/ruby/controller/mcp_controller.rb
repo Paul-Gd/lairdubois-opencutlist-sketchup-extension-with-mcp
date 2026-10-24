@@ -10,6 +10,7 @@ module Ladb::OpenCutList
   require_relative '../model/attributes/definition_attributes'
   require_relative '../model/attributes/material_attributes'
   require_relative '../utils/dimension_utils'
+  require_relative '../utils/color_utils'
 
   # Commands exposed to AI tools through the MCP bridge.
   #
@@ -67,6 +68,8 @@ module Ladb::OpenCutList
       # Materials
       PLUGIN.register_command('mcp_materials_list') { |params| materials_list_command(params) }
       PLUGIN.register_command('mcp_material_create') { |params| material_create_command(params) }
+      PLUGIN.register_command('mcp_material_update') { |params| material_update_command(params) }
+      PLUGIN.register_command('mcp_material_delete') { |params| material_delete_command(params) }
 
       # Cutlist
       PLUGIN.register_command('mcp_cutlist_get') { |params| cutlist_get_command(params) }
@@ -225,14 +228,31 @@ module Ladb::OpenCutList
 
       tags = Array(p[:tags]).map(&:to_s)
 
+      warnings = []
+
       material = nil
       if p[:material].is_a?(String) && !p[:material].strip.empty?
-        material_type = p[:material_type].nil? ? MaterialAttributes::TYPE_UNKNOWN : _material_type_to_int(p[:material_type])
+        material_name = p[:material].strip
+        requested_type = p[:material_type].nil? ? MaterialAttributes::TYPE_UNKNOWN : _material_type_to_int(p[:material_type])
+        existing_material = model.materials[material_name]
+
+        if existing_material.nil? && p[:create_material_if_missing] == false
+          raise McpError.new(
+            'material_not_found',
+            "Material '#{material_name}' does not exist. Create it first or set create_material_if_missing to true."
+          )
+        end
+
         color = p[:material_color] || _default_material_color(model)
-        material = MaterialAttributes.fetch_or_create_material(model, p[:material].strip, material_type, color)
+        material = MaterialAttributes.fetch_or_create_material(model, material_name, requested_type, color)
+
+        if existing_material.nil?
+          warnings << "Material '#{material_name}' did not exist and was created with type '#{_material_type_name(requested_type)}' and colour '#{color}'."
+        elsif p[:material_type] && MaterialAttributes.new(existing_material).type != requested_type
+          warnings << "Material '#{material_name}' already existed with type '#{_material_type_name(MaterialAttributes.new(existing_material).type)}'; the requested type '#{_material_type_name(requested_type)}' was not applied."
+        end
       end
 
-      warnings = []
       warnings << 'count is greater than 1 and spacing_mm is 0: the copies overlap.' if count > 1 && spacing == 0
 
       container_entities = _mcp_container_entities(model, p[:container_id])
@@ -482,7 +502,6 @@ module Ladb::OpenCutList
       dx = (p[:dx_mm] || 0).to_f
       dy = (p[:dy_mm] || 0).to_f
       dz = (p[:dz_mm] || 0).to_f
-      raise McpError.new('invalid_params', 'Provide a non-zero dx_mm, dy_mm or dz_mm.') if dx == 0 && dy == 0 && dz == 0
 
       cutlist = _cutlist
       part = _find_part(cutlist, part_id)
@@ -491,17 +510,20 @@ module Ladb::OpenCutList
       entities = _resolve_entities(model, part.entity_ids)
       raise McpError.new('part_not_found', 'None of the part instances could be resolved in the model.') if entities.empty?
 
-      model.start_operation('OCL MCP: Move Part', true)
-      begin
-        _mcp_translate_entities(entities, dx, dy, dz)
-        model.commit_operation
-      rescue Exception => e
+      # A zero offset is allowed: it is a useful "where is this part?" query.
+      unless dx == 0 && dy == 0 && dz == 0
+        model.start_operation('OCL MCP: Move Part', true)
         begin
-          model.abort_operation
-        rescue StandardError
-          # Nothing to abort.
+          _mcp_translate_entities(entities, dx, dy, dz)
+          model.commit_operation
+        rescue Exception => e
+          begin
+            model.abort_operation
+          rescue StandardError
+            # Nothing to abort.
+          end
+          raise e
         end
-        raise e
       end
 
       updated_cutlist = _cutlist
@@ -522,7 +544,7 @@ module Ladb::OpenCutList
           :bounds_mm => _mcp_part_world_bounds_mm(updated_part),
           :instances => updated_part.def.instance_infos.values
                                         .sort_by(&:serialized_path)
-                                        .map { |instance_info| _mcp_instance_world_info(instance_info) }
+                                        .map { |instance_info| _mcp_instance_world_info(instance_info, updated_part.def.size.axes) }
         }
       end
     end
@@ -714,7 +736,7 @@ module Ladb::OpenCutList
           :display_name => material[:display_name],
           :color => material[:color],
           :type => material[:type],
-          :type_name => MaterialAttributes.type_strippedname(material[:type]),
+          :type_name => _material_type_name(material[:type]),
           :thickness => material[:thickness],
           :std_sizes => material[:std_sizes],
           :std_thicknesses => material[:std_thicknesses],
@@ -763,8 +785,177 @@ module Ladb::OpenCutList
         :requested_name => name,
         :display_name => display_name,
         :type => type,
-        :type_name => MaterialAttributes.type_strippedname(type),
+        :type_name => _material_type_name(type),
         :result => response
+      }
+    end
+
+    def material_update_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      name = p[:name].to_s.strip
+      raise McpError.new('invalid_params', 'name is required.') if name.empty?
+
+      material = model.materials[name]
+      raise McpError.new('material_not_found', "Material '#{name}' does not exist.") if material.nil?
+
+      patch = p[:patch]
+      raise McpError.new('invalid_params', 'patch must be a non-empty object.') unless patch.is_a?(Hash) && !patch.empty?
+      patch = _deep_symbolize(patch)
+
+      allowed_keys = [
+        :display_name, :color, :description, :url, :type,
+        :thickness, :thickness_mm,
+        :length_increase, :length_increase_mm,
+        :width_increase, :width_increase_mm,
+        :thickness_increase, :thickness_increase_mm,
+        :std_sections, :std_lengths, :std_widths, :std_thicknesses, :std_sizes,
+        :grained, :edge_decremented, :raw_estimated, :multiplier_coefficient,
+        :std_volumic_masses, :std_prices, :std_cut_prices
+      ]
+      unknown_keys = patch.keys - allowed_keys
+      raise McpError.new('invalid_params', "Unsupported patch keys: #{unknown_keys.join(', ')}.") unless unknown_keys.empty?
+
+      # Start from the current full attribute set: MaterialsUpdateWorker writes
+      # every field, so a partial hash would silently clear the omitted ones.
+      attributes = MaterialAttributes.new(material)
+      data = {
+        :name => name,
+        # Preserve the SketchUp material name unless the patch asks for a
+        # rename; display_name is the name the update worker compares against.
+        :display_name => material.name,
+        :color => ColorUtils.color_to_hex(material.color, '#ffffff'),
+        :description => attributes.description.to_s,
+        :url => attributes.url.to_s,
+        :type => attributes.type,
+        :thickness => attributes.thickness.to_s,
+        :length_increase => attributes.length_increase.to_s,
+        :width_increase => attributes.width_increase.to_s,
+        :thickness_increase => attributes.thickness_increase.to_s,
+        :std_sections => attributes.std_sections,
+        :std_lengths => attributes.std_lengths,
+        :std_widths => attributes.std_widths,
+        :std_thicknesses => attributes.std_thicknesses,
+        :std_sizes => attributes.std_sizes,
+        :grained => attributes.grained,
+        :edge_decremented => attributes.edge_decremented,
+        :raw_estimated => attributes.raw_estimated,
+        :multiplier_coefficient => attributes.multiplier_coefficient,
+        :std_volumic_masses => attributes.std_volumic_masses,
+        :std_prices => attributes.std_prices,
+        :std_cut_prices => attributes.std_cut_prices,
+        :texture_file => nil,
+        :texture_changed => false,
+        :texture_rotation => 0,
+        :texture_width => nil,
+        :texture_height => nil,
+        :transparent_operation => false
+      }
+
+      patch.each do |key, value|
+        case key
+        when :display_name
+          data[:display_name] = value.to_s
+        when :color
+          data[:color] = value
+        when :description
+          data[:description] = value.to_s
+        when :url
+          data[:url] = value.to_s
+        when :type
+          data[:type] = _material_type_to_int(value)
+        when :thickness
+          data[:thickness] = value.to_s
+        when :thickness_mm
+          data[:thickness] = "#{value.to_f}mm"
+        when :length_increase
+          data[:length_increase] = value.to_s
+        when :length_increase_mm
+          data[:length_increase] = "#{value.to_f}mm"
+        when :width_increase
+          data[:width_increase] = value.to_s
+        when :width_increase_mm
+          data[:width_increase] = "#{value.to_f}mm"
+        when :thickness_increase
+          data[:thickness_increase] = value.to_s
+        when :thickness_increase_mm
+          data[:thickness_increase] = "#{value.to_f}mm"
+        when :std_sections, :std_lengths, :std_widths, :std_thicknesses, :std_sizes,
+             :grained, :edge_decremented, :raw_estimated, :multiplier_coefficient,
+             :std_volumic_masses, :std_prices, :std_cut_prices
+          data[key] = value
+        end
+      end
+
+      response = PLUGIN.execute_command('materials_update', data)
+      if response.is_a?(Hash) && response[:errors].is_a?(Array) && !response[:errors].empty?
+        raise McpError.new('material_update_failed', response[:errors].join(', '))
+      end
+
+      updated_attributes = MaterialAttributes.new(material)
+      {
+        :name => material.name,
+        :requested_name => name,
+        :display_name => material.name,
+        :material_display_name => material.display_name,
+        :renamed => material.name != name,
+        :color => ColorUtils.color_to_hex(material.color),
+        :type => updated_attributes.type,
+        :type_name => _material_type_name(updated_attributes.type),
+        :thickness => updated_attributes.thickness,
+        :description => updated_attributes.description,
+        :url => updated_attributes.url
+      }
+    end
+
+    def material_delete_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      name = p[:name].to_s.strip
+      raise McpError.new('invalid_params', 'name is required.') if name.empty?
+
+      material = model.materials[name]
+      raise McpError.new('material_not_found', "Material '#{name}' does not exist.") if material.nil?
+
+      cutlist = _cutlist
+      using_groups = cutlist.groups.select { |group| group.material_name == name }
+      if using_groups.any? && p[:force] != true
+        raise McpError.new(
+          'material_in_use',
+          "Material '#{name}' is used by #{using_groups.length} cutlist group(s). Reassign those parts first, or pass force: true."
+        )
+      end
+
+      warnings = []
+      warnings << "Material '#{name}' is used by #{using_groups.length} cutlist group(s); deletion was forced." if using_groups.any?
+
+      model.start_operation('OCL MCP: Delete Material', true)
+      begin
+        response = PLUGIN.execute_command('materials_delete', { :name => name })
+        if response.is_a?(Hash) && response[:success]
+          model.commit_operation
+        else
+          errors = response.is_a?(Hash) ? Array(response[:errors]) : []
+          raise McpError.new(
+            'material_delete_failed',
+            errors.empty? ? 'OpenCutList failed to delete the material.' : errors.join(', ')
+          )
+        end
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      {
+        :deleted => true,
+        :name => name,
+        :warnings => warnings
       }
     end
 
@@ -782,7 +973,7 @@ module Ladb::OpenCutList
           :id => group.id,
           :material_name => group.material_name,
           :material_display_name => group.material_display_name,
-          :material_type => group.material_type_strippedname,
+          :material_type => _material_type_name(group.material_type),
           :material_is_virtual => group.material_is_virtual,
           :part_count => group.part_count,
           :total_cutting_length => group.total_cutting_length,
@@ -863,7 +1054,7 @@ module Ladb::OpenCutList
     def _part_summary(part)
       size = part.def.size
       cutting_size = part.def.cutting_size
-      instances = part.def.instance_infos.values.sort_by(&:serialized_path).map { |instance_info| _mcp_instance_world_info(instance_info) }
+      instances = part.def.instance_infos.values.sort_by(&:serialized_path).map { |instance_info| _mcp_instance_world_info(instance_info, size.axes) }
 
       {
         :part_id => part.id,
@@ -880,7 +1071,7 @@ module Ladb::OpenCutList
         :cutting_thickness_mm => _mcp_mm(cutting_size.thickness),
         :count => part.count,
         :material => part.group.material_name,
-        :material_type => part.group.material_type_strippedname,
+        :material_type => _material_type_name(part.group.material_type),
         :tags => part.tags,
         :edge_materials => part.edge_material_names,
         :face_materials => part.face_material_names,
@@ -893,11 +1084,25 @@ module Ladb::OpenCutList
 
     def _part_detail(part)
       size = part.def.size
+      model = Sketchup.active_model
       {
         :summary => _part_summary(part),
         :axes => size.axes.map { |axis| _mcp_axis_name(axis) },
+        :edge_material_raw_colors => _raw_material_colors(model, part.edge_material_names),
+        :face_material_raw_colors => _raw_material_colors(model, part.face_material_names),
         :hash => part.to_hash
       }
+    end
+
+    # Raw material colours, as opposed to OCL's edge_material_colors which are
+    # deliberately darkened for display over white panels.
+    def _raw_material_colors(model, names)
+      return {} unless names.is_a?(Hash) && !model.nil?
+
+      names.each_with_object({}) do |(role, name), result|
+        material = name.nil? ? nil : model.materials[name]
+        result[role] = material.nil? ? nil : ColorUtils.color_to_hex(material.color)
+      end
     end
 
     def _positive_mm(value, name)
@@ -912,6 +1117,13 @@ module Ladb::OpenCutList
       type = MATERIAL_TYPES[value.to_s.strip.downcase]
       raise McpError.new('invalid_params', "Unknown material type '#{value}'.") if type.nil?
       type
+    end
+
+    # OCL's type_strippedname returns the historical 'unknow' spelling; expose
+    # the same value the tool inputs accept ('unknown') at the MCP boundary.
+    def _material_type_name(type)
+      name = MaterialAttributes.type_strippedname(type)
+      name == 'unknow' ? 'unknown' : name
     end
 
     def _validate_material_exists(model, name)
@@ -929,7 +1141,7 @@ module Ladb::OpenCutList
 
       raise McpError.new(
         'invalid_material_type',
-        "Material '#{name}' has type '#{MaterialAttributes.type_strippedname(actual_type)}', expected '#{MaterialAttributes.type_strippedname(expected_type)}'."
+        "Material '#{name}' has type '#{_material_type_name(actual_type)}', expected '#{_material_type_name(expected_type)}'."
       )
     end
 
