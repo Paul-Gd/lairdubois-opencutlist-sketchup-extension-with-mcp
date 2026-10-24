@@ -689,11 +689,47 @@ module Ladb::OpenCutList
       width = _clamp((p[:width] || 1200).to_i, 64, 4000)
       height = _clamp((p[:height] || 800).to_i, 64, 4000)
       isolate = p[:isolate] == true
-      zoom_extents = p[:zoom_extents] != false
       part_ids = Array(p[:part_ids]).map(&:to_s).reject(&:empty?)
+
+      view_preset = p[:view].to_s.strip.downcase
+      view_preset = nil if view_preset.empty?
+
+      camera_params = p[:camera]
+      unless camera_params.nil?
+        raise McpError.new('invalid_params', 'camera must be an object.') unless camera_params.is_a?(Hash)
+        camera_params = _deep_symbolize(camera_params)
+      end
+      if !view_preset.nil? && !camera_params.nil?
+        raise McpError.new('invalid_params', 'Use either view or camera, not both.')
+      end
+      unless view_preset.nil? || McpPartHelper::VIEW_DIRECTIONS.key?(view_preset)
+        raise McpError.new('invalid_params', "Unknown view '#{view_preset}'. Use front, back, left, right, top, bottom or iso.")
+      end
+
+      perspective = p[:perspective]
+      unless perspective.nil? || perspective == true || perspective == false
+        raise McpError.new('invalid_params', 'perspective must be true or false.')
+      end
+
+      fov = p[:fov]
+      unless fov.nil?
+        fov = fov.to_f
+        unless fov >= 1.0 && fov <= 120.0
+          raise McpError.new('invalid_params', 'fov must be between 1 and 120 degrees.')
+        end
+      end
+
+      # An explicit camera/view is used as-is; only the old behavior zooms by default.
+      zoom_extents = if p.key?(:zoom_extents)
+                       p[:zoom_extents] != false
+                     else
+                       view_preset.nil? && camera_params.nil?
+                     end
 
       parts = []
       paths = []
+      target_entities = []
+      target_bounds = nil
 
       unless part_ids.empty?
         cutlist = _cutlist
@@ -702,6 +738,16 @@ module Ladb::OpenCutList
           raise McpError.new('unsupported_entity', 'Virtual parts cannot be isolated in a screenshot.') if part.virtual
           parts << part
           paths.concat(part.def.instance_infos.values.map(&:path))
+          target_entities.concat(_resolve_entities(model, part.entity_ids))
+        end
+
+        unless parts.empty?
+          bounds = Geom::BoundingBox.new
+          parts.each do |part|
+            part_bounds = _mcp_part_bounds(part)
+            bounds.add(part_bounds) unless part_bounds.nil? || part_bounds.empty?
+          end
+          target_bounds = bounds unless bounds.empty?
         end
       end
 
@@ -716,7 +762,13 @@ module Ladb::OpenCutList
         :width => width,
         :height => height,
         :isolate => isolate,
-        :zoom_extents => zoom_extents
+        :zoom_extents => zoom_extents,
+        :target_entities => target_entities,
+        :target_bounds => target_bounds,
+        :view_preset => view_preset,
+        :camera_params => camera_params,
+        :perspective => perspective,
+        :fov => fov
       )
 
       result[:part_ids] = parts.map(&:id)

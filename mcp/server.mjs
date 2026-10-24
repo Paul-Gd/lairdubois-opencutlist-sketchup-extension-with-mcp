@@ -258,15 +258,28 @@ function registerTools(server) {
   server.registerTool('ocl_screenshot', {
     description:
       'Capture a PNG image of the current SketchUp viewport. With part_ids + isolate: true, temporarily hides everything that is not on those parts, ' +
-      'zooms to them, captures the image, then restores visibility and camera; the temporary changes do not stay on the undo stack. ' +
-      'Without isolate, the whole visible model is captured. Returns an image block plus metadata (path, size, hidden entity count). ' +
+      'captures the image, then restores visibility and camera; the temporary changes do not stay on the undo stack. ' +
+      'Camera control: view is one of front (looks +Y from -Y), back, left, right, top, bottom, iso (front-right-top); ' +
+      'or pass camera: { eye_mm, target_mm, up? } for an explicit world-space camera. perspective toggles orthographic/perspective (defaults to the current camera) ' +
+      'and fov is 1-120 degrees. With part_ids, the camera targets those parts; otherwise the whole model. ' +
+      'zoom_extents defaults to false when view/camera is given and true otherwise. Returns an image block plus metadata including the final camera. ' +
       'Recommended size 1200×800; both dimensions are capped at 4000.',
     inputSchema: z.object({
       part_ids: z.array(z.string().min(1)).optional(),
       isolate: z.boolean().optional(),
+      view: z.enum(['front', 'back', 'left', 'right', 'top', 'bottom', 'iso']).optional(),
+      camera: z.object({
+        eye_mm: z.tuple([z.number(), z.number(), z.number()]),
+        target_mm: z.tuple([z.number(), z.number(), z.number()]),
+        up: z.tuple([z.number(), z.number(), z.number()]).optional()
+      }).optional(),
+      perspective: z.boolean().optional(),
+      fov: z.number().min(1).max(120).optional(),
       width: z.number().int().min(64).max(4000).optional(),
       height: z.number().int().min(64).max(4000).optional(),
-      zoom_extents: z.boolean().optional()
+      zoom_extents: z.boolean().optional().describe('Frame the target after applying the view/camera. Defaults to false when view or camera is given, true otherwise.')
+    }).refine((value) => !(value.view && value.camera), {
+      message: 'Use either view or camera, not both.'
     }).refine((value) => !value.isolate || (Array.isArray(value.part_ids) && value.part_ids.length > 0), {
       message: 'isolate requires part_ids.'
     }),

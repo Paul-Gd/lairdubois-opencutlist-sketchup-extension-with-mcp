@@ -19,6 +19,19 @@ module Ladb::OpenCutList
       #ECCA48 #AE78A2 #FC9CA8 #9B755F #BAB0AC
     ).freeze
 
+    # Camera view presets: [direction from target to eye, up vector].
+    # SketchUp world: front = -Y, back = +Y, left = -X, right = +X,
+    # bottom = -Z, top = +Z.
+    VIEW_DIRECTIONS = {
+      'front' => [ Geom::Vector3d.new(0, -1, 0), Z_AXIS ],
+      'back' => [ Geom::Vector3d.new(0, 1, 0), Z_AXIS ],
+      'left' => [ Geom::Vector3d.new(-1, 0, 0), Z_AXIS ],
+      'right' => [ Geom::Vector3d.new(1, 0, 0), Z_AXIS ],
+      'top' => [ Geom::Vector3d.new(0, 0, 1), Y_AXIS ],
+      'bottom' => [ Geom::Vector3d.new(0, 0, -1), Y_AXIS.reverse ],
+      'iso' => [ Geom::Vector3d.new(1, -1, 1).normalize, Z_AXIS ]
+    }.freeze
+
     # Returns a definition name that does not collide with an existing one.
     def _mcp_unique_definition_name(model, name)
       base = name.is_a?(String) ? name.strip : ''
@@ -343,15 +356,35 @@ module Ladb::OpenCutList
       changed
     end
 
+    # Union of all instance world bounds for a part, as a BoundingBox.
+    # Used to aim a screenshot camera at selected parts.
+    def _mcp_part_bounds(part)
+      bounds = Geom::BoundingBox.new
+
+      part.def.instance_infos.values.each do |instance_info|
+        definition = instance_info.definition
+        definition_bounds = definition.nil? ? instance_info.definition_bounds : definition.bounds
+        next if definition_bounds.nil?
+
+        transformation = instance_info.transformation
+        (0..7).each { |index| bounds.add(definition_bounds.corner(index).transform(transformation)) }
+      end
+
+      bounds
+    end
+
     # Captures the current viewport as a PNG.
     #
     # When +isolate+ is true, everything that is not on one of +part_paths+ is
-    # temporarily hidden (siblings at every level, so nested parts work), the
-    # view is zoomed to the remaining geometry, the image is written, and both
-    # visibility and camera are restored. The temporary changes are wrapped in
-    # an operation that is aborted, so they never land on the undo stack.
-    def _mcp_capture_screenshot(model, view, part_paths, width: 1200, height: 800, isolate: false, zoom_extents: true)
-      camera = view.camera
+    # temporarily hidden (siblings at every level, so nested parts work).
+    # +view_preset+ / +camera_params+ set the camera before capture; the
+    # original camera is restored in the ensure path along with visibility.
+    # The temporary changes are wrapped in an operation that is aborted, so
+    # they never land on the undo stack.
+    def _mcp_capture_screenshot(model, view, part_paths, width: 1200, height: 800, isolate: false,
+                                zoom_extents: true, target_entities: [], target_bounds: nil,
+                                view_preset: nil, camera_params: nil, perspective: nil, fov: nil)
+      original_camera = view.camera
       previous_visibility = []
       operation_started = false
 
@@ -361,11 +394,20 @@ module Ladb::OpenCutList
         _mcp_hide_others_for_paths(model, part_paths, previous_visibility)
       end
 
+      _mcp_apply_camera(view, model, view_preset, camera_params, target_bounds, perspective, fov)
+
+      if zoom_extents
+        if target_entities.is_a?(Array) && !target_entities.empty?
+          view.zoom(target_entities)
+        else
+          view.zoom_extents
+        end
+      end
+
       directory = File.join(PLUGIN.temp_dir, 'mcp_screenshots')
       FileUtils.mkdir_p(directory)
       path = File.join(directory, "ocl-#{Time.now.strftime('%Y%m%d-%H%M%S')}-#{SecureRandom.hex(4)}.png")
 
-      view.zoom_extents if zoom_extents
       view.invalidate if view.respond_to?(:invalidate)
 
       ok = view.write_image({
@@ -389,7 +431,8 @@ module Ladb::OpenCutList
         :height => height,
         :bytes => File.size(path),
         :hidden_entity_count => previous_visibility.length,
-        :zoomed => zoom_extents
+        :zoomed => zoom_extents,
+        :camera => _mcp_camera_info(view)
       }
     ensure
       previous_visibility.reverse_each do |entity, visible|
@@ -401,7 +444,7 @@ module Ladb::OpenCutList
       end
 
       begin
-        view.camera = camera if view
+        view.camera = original_camera if view
       rescue StandardError
         # Camera restore is best effort.
       end
@@ -413,6 +456,114 @@ module Ladb::OpenCutList
           # Nothing to abort.
         end
       end
+    end
+
+    # Applies a view preset or an explicit camera. When neither is given, only
+    # projection/fov changes are applied (on a copy of the current camera).
+    def _mcp_apply_camera(view, model, view_preset, camera_params, target_bounds, perspective, fov)
+      current = view.camera
+      aspect = view.vpheight.to_f > 0 ? view.vpwidth.to_f / view.vpheight.to_f : 1.0
+      bounds = target_bounds || model.bounds
+      radius = [ bounds.width.to_f, bounds.height.to_f, bounds.depth.to_f ].max / 2.0
+      radius = 500.mm if radius <= 0
+
+      if camera_params
+        eye = _mcp_point3d_mm(camera_params[:eye_mm], 'camera.eye_mm')
+        target = _mcp_point3d_mm(camera_params[:target_mm], 'camera.target_mm')
+        if eye.distance(target) <= 0
+          raise McpError.new('invalid_params', 'camera.eye_mm and camera.target_mm must differ.')
+        end
+
+        up = camera_params[:up].nil? ? _mcp_up_for(eye, target) : _mcp_vector3d(camera_params[:up], 'camera.up')
+        perspective_flag = perspective.nil? ? current.perspective? : perspective
+        fov_value = _mcp_fov_value(current, fov)
+
+        camera = Sketchup::Camera.new(eye, target, up, perspective_flag, fov_value)
+        unless perspective_flag
+          camera.height = eye.distance(target) * 2.0 * Math.tan(fov_value.degrees / 2.0) / [ aspect, 1.0 ].min
+        end
+        view.camera = camera
+
+      elsif view_preset
+        direction, up = VIEW_DIRECTIONS[view_preset]
+        raise McpError.new('invalid_params', "Unknown view '#{view_preset}'.") if direction.nil?
+
+        center = bounds.center
+        perspective_flag = perspective.nil? ? current.perspective? : perspective
+        fov_value = _mcp_fov_value(current, fov)
+
+        if perspective_flag
+          half_vertical = fov_value.degrees / 2.0
+          half_horizontal = Math.atan(Math.tan(half_vertical) * aspect)
+          half_angle = [ half_vertical, half_horizontal ].min
+          distance = radius / Math.sin(half_angle)
+        else
+          distance = radius * 2.0
+        end
+        distance = radius * 1.1 if distance < radius * 1.1
+
+        eye = center.offset(direction, distance)
+        camera = Sketchup::Camera.new(eye, center, up, perspective_flag, fov_value)
+        camera.height = radius * 2.2 / [ aspect, 1.0 ].min unless perspective_flag
+        view.camera = camera
+
+      elsif !perspective.nil? || !fov.nil?
+        camera = _mcp_copy_camera(current)
+        camera.perspective = perspective unless perspective.nil?
+        camera.fov = fov unless fov.nil? || !camera.perspective?
+        view.camera = camera
+      end
+    end
+
+    def _mcp_camera_info(view)
+      camera = view.camera
+      {
+        :eye_mm => camera.eye.to_a.map { |value| value.to_mm.to_f.round(3) },
+        :target_mm => camera.target.to_a.map { |value| value.to_mm.to_f.round(3) },
+        :up => camera.up.to_a.map { |value| value.to_f.round(3) },
+        :perspective => camera.perspective?,
+        :fov => camera.perspective? ? camera.fov : nil,
+        :height_mm => camera.perspective? ? nil : camera.height.to_mm.to_f.round(3)
+      }
+    end
+
+    def _mcp_copy_camera(camera)
+      copy = Sketchup::Camera.new(camera.eye, camera.target, camera.up)
+      copy.perspective = camera.perspective?
+      if camera.perspective?
+        copy.fov = camera.fov
+      else
+        copy.height = camera.height
+      end
+      copy
+    end
+
+    def _mcp_point3d_mm(array, name)
+      unless array.is_a?(Array) && array.length == 3 && array.all? { |value| value.is_a?(Numeric) }
+        raise McpError.new('invalid_params', "#{name} must be an array of 3 numbers.")
+      end
+      Geom::Point3d.new(array[0].to_f.mm, array[1].to_f.mm, array[2].to_f.mm)
+    end
+
+    def _mcp_vector3d(array, name)
+      unless array.is_a?(Array) && array.length == 3 && array.all? { |value| value.is_a?(Numeric) }
+        raise McpError.new('invalid_params', "#{name} must be an array of 3 numbers.")
+      end
+
+      vector = Geom::Vector3d.new(array[0].to_f, array[1].to_f, array[2].to_f)
+      length = vector.length
+      raise McpError.new('invalid_params', "#{name} must be non-zero.") if length <= 0
+
+      Geom::Vector3d.new(vector.x / length, vector.y / length, vector.z / length)
+    end
+
+    def _mcp_up_for(eye, target)
+      eye.vector_to(target).parallel?(Z_AXIS) ? Y_AXIS : Z_AXIS
+    end
+
+    def _mcp_fov_value(camera, fov)
+      return fov.to_f unless fov.nil?
+      camera.perspective? ? camera.fov : 35.0
     end
 
     # Hides every entity that is not on one of the target paths, at every

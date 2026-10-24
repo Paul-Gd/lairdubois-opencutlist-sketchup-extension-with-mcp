@@ -183,13 +183,25 @@ SketchUp menu or a manual smoke test, not from the MCP client.
 14. **Screenshots are temporary visibility changes.** `mcp_screenshot` calls
     `View#write_image` (returns a Boolean). With `isolate`, it walks each
     target instance path and hides every sibling at every parent collection,
-    keeps the ancestors/targets visible, zooms extents, captures, then restores
-    visibility and the camera in an `ensure`. The visibility changes are wrapped
-    in a normal operation that is **aborted**, so they never enter the undo
-    stack. Target parts must already be visible; a hidden target is not
-    unhidden. Locked entities may reject visibility changes. The PNG is written
-    under `PLUGIN.temp_dir/mcp_screenshots/` (newest 20 kept); the Node server
-    reads that file and returns it as an MCP image block.
+    keeps the ancestors/targets visible, captures, then restores visibility and
+    the camera in an `ensure`. The visibility changes are wrapped in a normal
+    operation that is **aborted**, so they never enter the undo stack. Target
+    parts must already be visible; a hidden target is not unhidden. Locked
+    entities may reject visibility changes. The PNG is written under
+    `PLUGIN.temp_dir/mcp_screenshots/` (newest 20 kept); the Node server reads
+    that file and returns it as an MCP image block.
+    Camera control: `_mcp_apply_camera` supports `view` presets
+    (`front/back/left/right/top/bottom/iso`, world axes; front = eye on -Y
+    looking +Y; top up = +Y; bottom up = -Y; iso = front-right-top) and an
+    explicit `camera: { eye_mm, target_mm, up? }`. `perspective` keeps the
+    current projection unless supplied; `fov` is 1–120. Presets frame the
+    `target_bounds` (union of target part bounds, or `model.bounds`) using a
+    bounding-sphere distance; orthographic presets also set `camera.height`.
+    Explicit cameras are used as-is. `zoom_extents` defaults to false when
+    view/camera is given and true otherwise; when true it frames
+    `target_entities` via `view.zoom` if parts were supplied, else
+    `view.zoom_extents`. The applied camera is returned as metadata
+    (`eye_mm`, `target_mm`, `up`, `perspective`, `fov`/`height_mm`).
 15. **Hiding is a real model change.** `mcp_parts_visibility` commits an
     undoable operation. Hidden parts are excluded from OpenCutList cutlists, so
     a hidden part cannot be found by `part_id`; the hide response returns
@@ -294,6 +306,18 @@ Feedback regression tests (2026-10-25, feedback round 1):
   undo step.
 - Rotated part `[0,90,0]`: bounds `z=-600..0`, `xmin` label `top`, `xmax`
   `bottom`, `zmin` `left`, `zmax` `right` — matching the documented table.
+
+Camera tests (same session, 600×400×18 box at the origin):
+
+- `view: front`: camera eye `[300,-797.653,9]`, target `[300,200,9]`, up `+Z`;
+  the PNG is a 600×18 strip (front elevation).
+- `view: top`: eye `[300,200,1006.653]`, target `[300,200,9]`, up `+Y`; the PNG
+  is a 600×400 rectangle.
+- `view: iso`: eye `[875.995,-375.995,584.995]`; the PNG shows the box in
+  three-quarter view.
+- Explicit camera eye `[1200,-1200,900]`, target `[300,200,9]`,
+  `perspective: false`: metadata reports the exact eye/target, orthographic
+  height `1190.457 mm`, and the expected orthographic image.
 
 ## Known limitations / future work
 

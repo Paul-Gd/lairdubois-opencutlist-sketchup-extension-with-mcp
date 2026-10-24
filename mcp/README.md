@@ -141,11 +141,26 @@ returned id for later calls.
 
 - `ocl_screenshot` returns a PNG image block of the current viewport. Pass
   `part_ids` with `isolate: true` to show only those parts: everything else is
-  temporarily hidden (including siblings inside groups), the view zooms to the
-  selection, the image is captured, then visibility and camera are restored.
-  The temporary changes are aborted, so they do not appear on the undo stack.
-  Without `isolate`, the whole visible model is captured. Default size is
-  1200×800; dimensions are capped at 4000.
+  temporarily hidden (including siblings inside groups), the image is captured,
+  then visibility and camera are restored. The temporary changes are aborted, so
+  they do not appear on the undo stack. Without `isolate`, the whole visible
+  model is captured. Default size is 1200×800; dimensions are capped at 4000.
+- **Camera presets:** `view: front | back | left | right | top | bottom | iso`.
+  Directions are in SketchUp world axes: front looks along +Y from the -Y side,
+  back from +Y, left from -X, right from +X, top from +Z (up = +Y), bottom from
+  -Z (up = -Y), iso from front-right-top. With `part_ids`, the camera targets
+  those parts; otherwise the whole model.
+- **Explicit camera:** `camera: { eye_mm: [x,y,z], target_mm: [x,y,z], up?: [x,y,z] }`
+  (world millimetres, `up` defaults to +Z unless the view direction is vertical).
+  Do not combine `camera` with `view`.
+- **Projection:** `perspective: true|false` (defaults to the current camera) and
+  `fov` (1–120°, perspective cameras). Orthographic presets set their height
+  automatically.
+- `zoom_extents` defaults to false when `view`/`camera` is supplied (use the
+  requested camera as-is) and true otherwise; set it to true to frame the target
+  after applying the camera.
+- The response metadata includes the final `camera` (eye/target/up in mm,
+  perspective, fov or orthographic height), so the caller can verify the view.
 - Screenshots use the current SketchUp style/background and are written under
   the OpenCutList temp directory (`mcp_screenshots/`). The newest 20 are kept.
 - `ocl_set_parts_visibility` hides or shows parts as a normal undoable change.
@@ -159,6 +174,9 @@ returned id for later calls.
 - “Create an edge material called Oak edge, 2 mm, type edge.”
 - “Give the shelf a 2 mm edge on ymin and ymax.”
 - “Resize the shelf to 800 × 400 × 18.”
+- “Show me the front elevation of the shelf, isolated.”
+- “Take a top view of the wardrobe.”
+- “Screenshot from eye [2000,-2000,1500] looking at the carcass centre.”
 - “Move it 100 mm up and select it.”
 - “Delete it.” (Claude Code asks for confirmation; the bridge also requires
   `confirm: true`.)
