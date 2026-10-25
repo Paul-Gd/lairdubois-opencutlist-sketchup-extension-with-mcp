@@ -100,16 +100,53 @@ module Ladb::OpenCutList
       definition
     end
 
+    # Cylinder along the definition-local X axis (OCL's default length axis).
+    # The definition origin is the centre of the base circle, so position_mm is
+    # that centre (not the bounding-box minimum).
+    def _mcp_create_cylinder_definition(model, name, length, diameter, tags)
+      definition = model.definitions.add(name)
+      entities = definition.entities
+
+      edges = entities.add_circle(ORIGIN, X_AXIS, diameter / 2.0, 24)
+      raise McpError.new('create_failed', 'Failed to create the cylinder base circle.') if edges.nil? || edges.empty?
+
+      face = entities.add_face(edges)
+      raise McpError.new('create_failed', 'Failed to create the cylinder base face.') if face.nil?
+
+      face.reverse! unless face.normal.samedirection?(X_AXIS)
+      face.pushpull(length)
+
+      bounds = definition.bounds
+      if bounds.width.to_f <= 0.001 || bounds.height.to_f <= 0.001 || bounds.depth.to_f <= 0.001
+        raise McpError.new('create_failed', 'Failed to extrude the cylinder.')
+      end
+
+      if bounds.min.x < -0.001
+        entities.transform_entities(
+          Geom::Transformation.new(Geom::Vector3d.new(-bounds.min.x, 0, 0)),
+          entities.to_a
+        )
+      end
+
+      definition_attributes = DefinitionAttributes.new(definition)
+      definition_attributes.orientation_locked_on_axis = true
+      definition_attributes.tags = tags unless tags.nil?
+      definition_attributes.uuid
+      definition_attributes.write_to_attributes
+
+      definition
+    end
+
     # Local dimension match tolerance for definition reuse.
     DEFINITION_SIZE_TOLERANCE = 0.5.mm
 
-    def _mcp_definition_dimensions_match?(definition, length, width, thickness)
+    def _mcp_definition_dimensions_match?(definition, expected_width, expected_height, expected_depth)
       bounds = definition.bounds
       return false if bounds.nil?
 
-      (bounds.width - length).abs <= DEFINITION_SIZE_TOLERANCE &&
-        (bounds.height - width).abs <= DEFINITION_SIZE_TOLERANCE &&
-        (bounds.depth - thickness).abs <= DEFINITION_SIZE_TOLERANCE
+      (bounds.width - expected_width).abs <= DEFINITION_SIZE_TOLERANCE &&
+        (bounds.height - expected_height).abs <= DEFINITION_SIZE_TOLERANCE &&
+        (bounds.depth - expected_depth).abs <= DEFINITION_SIZE_TOLERANCE
     end
 
     # Returns [definition, reused, warnings].
@@ -119,13 +156,14 @@ module Ladb::OpenCutList
     # instances into the existing cutlist line. Tags and orientation flags are
     # definition-level properties: a reused definition keeps them, and a
     # differing tag set is reported as a warning.
-    def _mcp_prepare_box_definition(model, name, length, width, thickness, tags, reuse_definition)
+    def _mcp_prepare_definition(model, name, shape, length, width, thickness, diameter, tags, reuse_definition)
+      expected = shape == 'cylinder' ? [ length, diameter, diameter ] : [ length, width, thickness ]
       warnings = []
 
       if reuse_definition
         existing = model.definitions[name]
         if existing
-          if _mcp_definition_dimensions_match?(existing, length, width, thickness)
+          if _mcp_definition_dimensions_match?(existing, *expected)
             # Ensure a stable OCL UUID without touching the definition's tags
             # or orientation attributes.
             DefinitionAttributes.new(existing).uuid
@@ -144,7 +182,11 @@ module Ladb::OpenCutList
       end
 
       definition_name = _mcp_unique_definition_name(model, name)
-      definition = _mcp_create_box_definition(model, definition_name, length, width, thickness, tags)
+      definition = if shape == 'cylinder'
+                     _mcp_create_cylinder_definition(model, definition_name, length, diameter, tags)
+                   else
+                     _mcp_create_box_definition(model, definition_name, length, width, thickness, tags)
+                   end
       [ definition, false, warnings ]
     end
 
@@ -360,6 +402,18 @@ module Ladb::OpenCutList
       end
 
       ids
+    end
+
+    # Groups sibling entities into a new SketchUp group. OCL traverses groups
+    # as containers, so the cutlist keeps listing the children and does not add
+    # the container itself.
+    def _mcp_create_group(parent_entities, entities, name)
+      group = parent_entities.add_group(entities)
+      raise McpError.new('group_failed', 'SketchUp failed to create the group.') if group.nil?
+
+      group.name = name
+      group.definition.name = name
+      group
     end
 
     # Resolves the container for a newly created part. Only groups are accepted:

@@ -65,6 +65,7 @@ returned id or call `ocl_list_parts` again.
 | `ocl_resize_part` | write | Set absolute dimensions |
 | `ocl_move_part` | write | Translate all instances |
 | `ocl_select_parts` | write | Select parts in SketchUp |
+| `ocl_create_group` | write | Group parts into a SketchUp group |
 | `ocl_set_parts_visibility` | write | Hide or show parts |
 | `ocl_screenshot` | read | PNG of the viewport, optionally isolated to chosen parts |
 | `ocl_delete_part` | destructive | Delete all instances (requires `confirm: true`) |
@@ -133,6 +134,23 @@ merged `count`. Set `reuse_definition: false` to force a new definition.
 - Material is per instance. OCL groups by material, so identical geometry with
   different instance materials still produces separate cutlist lines.
 
+#### Groups and cylinders
+
+- `ocl_create_group(name, part_ids)` groups sibling parts into a SketchUp
+  group. All parts must be in the same container (model root or the same
+  group); parts in different containers must be moved first. OpenCutList
+  traverses groups as containers, so the cutlist is unchanged and the group
+  itself is not counted. The response returns the group entity id/guid, name,
+  member entity ids and world bounds. Groups organize the model/outliner; OCL
+  cutlists still group by material, not by SketchUp group.
+- `ocl_create_part` accepts `shape: "cylinder"` with `length_mm` along the
+  definition-local **X** axis (OCL's default length axis) and `diameter_mm`.
+  The cylinder origin is the centre of its base circle, so `position_mm` is
+  that point and the cylinder extends along world +X with the default rotation.
+  Use `rotation_deg` to orient it (e.g. `[0, -90, 0]` stands it vertically).
+  `width_mm`/`thickness_mm` are ignored for cylinders. Edge banding and veneers
+  are box-oriented and not meaningful on a cylinder.
+
 #### Material semantics
 
 - `ocl_create_part` creates a missing material automatically and reports it in
@@ -194,6 +212,8 @@ returned id for later calls.
 - “List the OpenCutList parts.”
 - “Create a 600 × 400 × 18 mm oak shelf at 0,0,0.”
 - “Create three identical 360 × 545 × 18 shelves, 300 mm apart in Z.”
+- “Create a 756 mm long, 25 mm diameter rail at the top of the wardrobe.”
+- “Group the two side panels and the shelf under ‘Carcass’.”
 - “Create an edge material called Oak edge, 2 mm, type edge.”
 - “Give the shelf a 2 mm edge on ymin and ymax.”
 - “Resize the shelf to 800 × 400 × 18.”

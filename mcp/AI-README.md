@@ -108,6 +108,7 @@ is single-threaded.
 | `ocl_move_part` | `mcp_part_move` | write |
 | `ocl_delete_part` | `mcp_part_delete` | destructive |
 | `ocl_select_parts` | `mcp_parts_select` | write (selection) |
+| `ocl_create_group` | `mcp_create_group` | write (grouping) |
 | `ocl_set_parts_visibility` | `mcp_parts_visibility` | write (hide/show) |
 | `ocl_screenshot` | `mcp_screenshot` | view capture |
 | `ocl_create_material` | `mcp_material_create` | write |
@@ -233,16 +234,27 @@ SketchUp menu or a manual smoke test, not from the MCP client.
 20. **Zero move is allowed.** `ocl_move_part` with a zero offset performs no
     operation but returns the current world bounds and instance positions; it is
     the cheapest "where is this part?" query.
-21. **Definitions are reused by default.** `_mcp_prepare_box_definition`
-    matches an existing definition by name and local length/width/thickness
-    (tolerance 0.5 mm). A match reuses it, so `PartDef.generate_part_id` (which
-    includes the definition UUID) produces the same OCL part and the instances
-    merge into one cutlist line. On reuse, only the OCL UUID is ensured; tags and
-    orientation flags are definition-level and intentionally preserved (a
-    differing requested tag set is warned). A name match with different
-    dimensions creates a uniquely named definition and warns. Material is per
-    instance, so OCL still splits by material. `count_axis` offsets copies along
-    world X/Y/Z (default X).
+21. **Definitions are reused by default.** `_mcp_prepare_definition`
+    matches an existing definition by name and expected local dimensions
+    (tolerance 0.5 mm: box = L×W×T, cylinder = diameter×diameter×length). A
+    match reuses it, so `PartDef.generate_part_id` (which includes the
+    definition UUID) produces the same OCL part and the instances merge into one
+    cutlist line. On reuse, only the OCL UUID is ensured; tags and orientation
+    flags are definition-level and intentionally preserved (a differing
+    requested tag set is warned). A name match with different dimensions creates
+    a uniquely named definition and warns. Material is per instance, so OCL
+    still splits by material. `count_axis` offsets copies along world X/Y/Z
+    (default X).
+22. **Groups are containers; cylinders are Z-oriented.** `mcp_create_group`
+    uses `Entities#add_group(entities)` on siblings. All member entities must
+    share the same parent collection (same model root or same group); OCL
+    traverses the resulting `Sketchup::Group` as a container and does not count
+    it, so the cutlist is unchanged. Group names are set on both the instance
+    and its definition. Cylinders are created with `add_circle` + `add_face` +
+    `pushpull` along local X (OCL's default length axis), origin at the
+    base-circle centre; `shape: "cylinder"` requires `diameter_mm`, ignores
+    width/thickness, and reuses definitions by length/diameter/diameter. Edge
+    and veneer banding remains box-oriented and is not meaningful on cylinders.
 
 ## What changed in the existing OpenCutList code
 
@@ -343,6 +355,17 @@ Cutlist-merging tests (same session, 360×545×18 shelves):
   session's MCP client still had the camera-era tool schema cached; the Node
   server code contains the new fields and a fresh MCP connection picks them up.
 
+Groups/cylinders tests (same session):
+
+- Cylinder rail `length 756, diameter 25` at `[0,0,1000]`, rotation `[0,0,0]`:
+  OCL reports length/width/thickness `756/25/25`; bounds x `0..756`,
+  y `-12.5..12.5`, z `987.5..1012.5`.
+- Second identical rail at `[0,1000,1000]`: definition reused, one cutlist line
+  with `count: 2`.
+- Grouping two 200×200×18 boxes under "MCP Test Group": group entity id/guid
+  returned, cutlist still three lines (rail count 2 + A + B), and the boxes'
+  instance paths read `MCP Test Group` (serialized paths include the group id).
+
 ## Known limitations / future work
 
 - `ocl_create_part` creates rectangular boxes only. Smart Draw supports
@@ -352,7 +375,10 @@ Cutlist-merging tests (same session, 360×545×18 shelves):
 - No material update/delete MCP tool (create/list only). The UI can purge
   unused materials.
 - No part thumbnails (the viewport screenshot is the visual tool), batch part
-  update, grouping/outliner, export or packing tools.
+  update, group editing/ungrouping, outliner, export or packing tools. Groups
+  can be created only from parts that already share a container.
+- Cylinders support length/diameter only; edge banding/veneers are not
+  meaningful on them. Boxes remain the only shape with edge/face roles.
 - Screenshot isolation only hides siblings along the target paths; it cannot
   isolate inside a shared component definition without temporarily affecting
   other instances of that definition (restored afterwards). Captures use the

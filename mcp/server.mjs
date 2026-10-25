@@ -168,7 +168,9 @@ function registerTools(server) {
 
   registerTool(server, 'ocl_create_part', {
     description:
-      'Create one or more rectangular parts in the model and register them with OpenCutList. All dimensions and positions are in millimetres. ' +
+      'Create one or more parts in the model and register them with OpenCutList. All dimensions and positions are in millimetres. ' +
+      'shape defaults to "box" (length × width × thickness). shape "cylinder" uses length_mm along local X and diameter_mm; width_mm/thickness_mm are ignored. ' +
+      'A cylinder origin is the centre of its base circle, and its length runs along local +X (rotation [0,-90,0] stands it vertically). ' +
       'The part definition is created at the model root unless container_id names a group. position_mm is the transformed local origin, not the bbox minimum. ' +
       'Rotations compose T(position) * Rx * Ry * Rz: with [0,90,0] local length maps to world -Z (the part extends downward), with [0,-90,0] to world +Z, ' +
       'and with [90,0,0] local width maps to world +Z. Use rotation_deg [0,90,0] plus position z=height to stand a panel upright on the floor. ' +
@@ -178,9 +180,11 @@ function registerTools(server) {
       'If the material does not exist it is created (type unknown unless material_type is given); set create_material_if_missing: false to fail instead.',
     inputSchema: z.object({
       name: z.string().min(1).describe('Definition/part name, e.g. "Shelf".'),
+      shape: z.enum(['box', 'cylinder']).optional().describe('Defaults to box. Cylinders use length_mm along local X and diameter_mm.'),
       length_mm: z.number().positive().max(100000),
-      width_mm: z.number().positive().max(100000),
-      thickness_mm: z.number().positive().max(100000),
+      width_mm: z.number().positive().max(100000).optional().describe('Required for boxes; ignored for cylinders.'),
+      thickness_mm: z.number().positive().max(100000).optional().describe('Required for boxes; ignored for cylinders.'),
+      diameter_mm: z.number().positive().max(100000).optional().describe('Required for cylinders; ignored for boxes.'),
       position_mm: z.tuple([z.number(), z.number(), z.number()]).optional().describe('World position in mm; defaults to [0,0,0].'),
       rotation_deg: z.tuple([z.number(), z.number(), z.number()]).optional().describe('Rotation around X, Y, Z in degrees; defaults to [0,0,0].'),
       count: z.number().int().min(1).max(1000).optional(),
@@ -193,6 +197,10 @@ function registerTools(server) {
       create_material_if_missing: z.boolean().optional().describe('When false, fail if the material does not exist instead of creating it. Defaults to true.'),
       tags: z.array(z.string()).optional(),
       container_id: z.number().int().optional().describe('Optional entityID of a group to create the part inside. Components are rejected.')
+    }).refine((value) => value.shape === 'cylinder'
+      ? value.diameter_mm !== undefined
+      : (value.width_mm !== undefined && value.thickness_mm !== undefined), {
+      message: 'Boxes require width_mm and thickness_mm; cylinders require diameter_mm.'
     }),
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_part_create', { timeoutMs: 120000 });
@@ -244,6 +252,18 @@ function registerTools(server) {
     }),
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_parts_select', { timeoutMs: 60000 });
+
+  registerTool(server, 'ocl_create_group', {
+    description:
+      'Group parts into a new SketchUp group (container). All parts must be in the same container (the model root or the same group). ' +
+      'OpenCutList traverses groups as containers, so the cutlist keeps listing the parts and does not add the container. ' +
+      'Returns the group entity id/guid, names, member entity ids and world bounds.',
+    inputSchema: z.object({
+      name: z.string().min(1),
+      part_ids: z.array(z.string().min(1)).min(1)
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
+  }, 'mcp_create_group', { timeoutMs: 120000 });
 
   registerTool(server, 'ocl_set_parts_visibility', {
     description:

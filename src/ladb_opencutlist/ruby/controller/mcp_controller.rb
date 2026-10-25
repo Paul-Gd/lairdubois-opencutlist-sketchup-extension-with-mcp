@@ -63,6 +63,7 @@ module Ladb::OpenCutList
       PLUGIN.register_command('mcp_part_delete') { |params| part_delete_command(params) }
       PLUGIN.register_command('mcp_parts_select') { |params| parts_select_command(params) }
       PLUGIN.register_command('mcp_parts_visibility') { |params| parts_visibility_command(params) }
+      PLUGIN.register_command('mcp_create_group') { |params| group_create_command(params) }
       PLUGIN.register_command('mcp_screenshot') { |params| screenshot_command(params) }
 
       # Materials
@@ -206,9 +207,28 @@ module Ladb::OpenCutList
       name = p[:name].to_s.strip
       raise McpError.new('invalid_params', 'name is required.') if name.empty?
 
+      warnings = []
+
+      shape = (p[:shape] || 'box').to_s.downcase
+      unless %w(box cylinder).include?(shape)
+        raise McpError.new('invalid_params', "shape must be 'box' or 'cylinder'.")
+      end
+
       length = _positive_mm(p[:length_mm], 'length_mm')
-      width = _positive_mm(p[:width_mm], 'width_mm')
-      thickness = _positive_mm(p[:thickness_mm], 'thickness_mm')
+
+      if shape == 'cylinder'
+        diameter = _positive_mm(p[:diameter_mm], 'diameter_mm')
+        width = p[:width_mm].nil? ? nil : _positive_mm(p[:width_mm], 'width_mm')
+        thickness = p[:thickness_mm].nil? ? nil : _positive_mm(p[:thickness_mm], 'thickness_mm')
+        if !p[:width_mm].nil? || !p[:thickness_mm].nil?
+          warnings << 'width_mm and thickness_mm are ignored for cylinders.'
+        end
+      else
+        width = _positive_mm(p[:width_mm], 'width_mm')
+        thickness = _positive_mm(p[:thickness_mm], 'thickness_mm')
+        diameter = nil
+        warnings << 'diameter_mm is ignored for boxes.' unless p[:diameter_mm].nil?
+      end
 
       position = p[:position_mm] || [ 0, 0, 0 ]
       unless position.is_a?(Array) && position.length == 3
@@ -234,8 +254,6 @@ module Ladb::OpenCutList
       axis_index = { 'x' => 0, 'y' => 1, 'z' => 2 }[count_axis]
 
       tags = Array(p[:tags]).map(&:to_s)
-
-      warnings = []
 
       material = nil
       if p[:material].is_a?(String) && !p[:material].strip.empty?
@@ -269,12 +287,14 @@ module Ladb::OpenCutList
 
       model.start_operation('OCL MCP: Create Part', true)
       begin
-        definition, reused_definition, definition_warnings = _mcp_prepare_box_definition(
+        definition, reused_definition, definition_warnings = _mcp_prepare_definition(
           model,
           name,
+          shape,
           length.mm,
-          width.mm,
-          thickness.mm,
+          width.nil? ? nil : width.mm,
+          thickness.nil? ? nil : thickness.mm,
+          diameter.nil? ? nil : diameter.mm,
           tags,
           reuse_definition
         )
@@ -311,6 +331,8 @@ module Ladb::OpenCutList
         :created_instance_count => created_entities.length,
         :definition_id => definition.nil? ? nil : definition.name,
         :reused_definition => reused_definition,
+        :shape => shape,
+        :diameter_mm => diameter,
         :warnings => warnings
       }
       if part.nil?
@@ -692,6 +714,67 @@ module Ladb::OpenCutList
         :part_ids => part_ids,
         :entity_ids => entities.map { |entity| entity.entityID },
         :note => visible ? nil : 'Hidden parts are excluded from OpenCutList cutlists. Use the returned entity_ids to show them again.'
+      }
+    end
+
+    def group_create_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      name = p[:name].to_s.strip
+      raise McpError.new('invalid_params', 'name is required.') if name.empty?
+
+      part_ids = Array(p[:part_ids]).map(&:to_s).reject(&:empty?)
+      raise McpError.new('invalid_params', 'part_ids must be a non-empty array.') if part_ids.empty?
+
+      cutlist = _cutlist
+      parts = part_ids.map { |part_id| _find_part(cutlist, part_id) }
+      parts.each do |part|
+        raise McpError.new('unsupported_entity', 'Virtual parts cannot be grouped directly. Group the real part instead.') if part.virtual
+      end
+
+      entities = parts.inject([]) { |memo, part| memo + _resolve_entities(model, part.entity_ids) }
+      entities = entities.uniq { |entity| entity.entityID }
+      raise McpError.new('part_not_found', 'None of the requested parts could be resolved.') if entities.empty?
+
+      containers = entities.map(&:parent)
+      container_keys = containers.map do |container|
+        container.is_a?(Sketchup::Model) ? :model : container.object_id
+      end
+      if container_keys.uniq.length > 1
+        raise McpError.new('different_parents', 'All parts must be in the same container (the model root or the same group) to be grouped.')
+      end
+      parent_entities = containers.first.entities
+
+      bounds = Geom::BoundingBox.new
+      parts.each do |part|
+        part_bounds = _mcp_part_bounds(part)
+        bounds.add(part_bounds) unless part_bounds.nil? || part_bounds.empty?
+      end
+
+      group = nil
+      model.start_operation('OCL MCP: Create Group', true)
+      begin
+        group = _mcp_create_group(parent_entities, entities, name)
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      {
+        :group_entity_id => group.entityID,
+        :group_guid => group.respond_to?(:guid) ? group.guid : nil,
+        :group_name => group.name,
+        :definition_name => group.definition.name,
+        :part_ids => parts.map(&:id),
+        :part_count => parts.length,
+        :member_entity_ids => entities.map { |entity| entity.entityID },
+        :bounds_mm => bounds.empty? ? nil : _mcp_bounds_mm(bounds)
       }
     end
 
