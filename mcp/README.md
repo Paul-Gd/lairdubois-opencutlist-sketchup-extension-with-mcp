@@ -111,6 +111,28 @@ To stand a 1760 mm panel on the floor with `[0, 90, 0]`, pass
 `position_mm: [x, y, 1760]`; with `[0, -90, 0]`, use `z = 0`. Always confirm
 with the returned `bounds_mm`.
 
+#### Shared definitions and cutlist merging
+
+`ocl_create_part` defaults to `reuse_definition: true`. When a definition with
+the same **name** and the same **local length × width × thickness** (within
+0.5 mm) already exists, a new instance is added to that definition instead of
+creating another one. OpenCutList then reports a single cutlist line with the
+merged `count`. Set `reuse_definition: false` to force a new definition.
+
+- `count` copies are offset by `spacing_mm` along `count_axis`
+  (`x`, `y` or `z`, default `x`). Three shelves on Z:
+  `count: 3, count_axis: "z", spacing_mm: 300`.
+- Reusing a definition also works across separate calls: create the same
+  name/dimensions at different `position_mm` values.
+- Tags and `orientation_locked_on_axis` are definition-level properties. A
+  reused definition keeps its existing values; a differing requested tag set is
+  returned as a warning. Use `ocl_update_part` to change them (it affects every
+  instance of the definition).
+- If the name exists but the local dimensions differ, a new uniquely named
+  definition is created and the response warns.
+- Material is per instance. OCL groups by material, so identical geometry with
+  different instance materials still produces separate cutlist lines.
+
 #### Material semantics
 
 - `ocl_create_part` creates a missing material automatically and reports it in
@@ -171,6 +193,7 @@ returned id for later calls.
 
 - “List the OpenCutList parts.”
 - “Create a 600 × 400 × 18 mm oak shelf at 0,0,0.”
+- “Create three identical 360 × 545 × 18 shelves, 300 mm apart in Z.”
 - “Create an edge material called Oak edge, 2 mm, type edge.”
 - “Give the shelf a 2 mm edge on ymin and ymax.”
 - “Resize the shelf to 800 × 400 × 18.”

@@ -173,6 +173,8 @@ function registerTools(server) {
       'Rotations compose T(position) * Rx * Ry * Rz: with [0,90,0] local length maps to world -Z (the part extends downward), with [0,-90,0] to world +Z, ' +
       'and with [90,0,0] local width maps to world +Z. Use rotation_deg [0,90,0] plus position z=height to stand a panel upright on the floor. ' +
       'Returns the new part with a fresh part_id, world bounds and per-instance world positions in millimetres. ' +
+      'By default reuse_definition is true: an existing definition with the same name and local dimensions is reused, so OpenCutList merges the new instances into one cutlist line (count). ' +
+      'Set reuse_definition: false to force a new definition. count copies are offset along count_axis (default x) by spacing_mm. ' +
       'If the material does not exist it is created (type unknown unless material_type is given); set create_material_if_missing: false to fail instead.',
     inputSchema: z.object({
       name: z.string().min(1).describe('Definition/part name, e.g. "Shelf".'),
@@ -182,7 +184,9 @@ function registerTools(server) {
       position_mm: z.tuple([z.number(), z.number(), z.number()]).optional().describe('World position in mm; defaults to [0,0,0].'),
       rotation_deg: z.tuple([z.number(), z.number(), z.number()]).optional().describe('Rotation around X, Y, Z in degrees; defaults to [0,0,0].'),
       count: z.number().int().min(1).max(1000).optional(),
-      spacing_mm: z.number().min(0).optional().describe('Distance between copies along X, in mm.'),
+      spacing_mm: z.number().min(0).optional().describe('Distance between copies along count_axis, in mm.'),
+      count_axis: z.enum(['x', 'y', 'z']).optional().describe('World axis for spacing copies; defaults to x.'),
+      reuse_definition: z.boolean().optional().describe('Defaults to true: reuse an existing definition with the same name and local dimensions so OpenCutList merges the instances. Set false to force a new definition.'),
       material: z.string().optional().describe('Material name; created if it does not exist.'),
       material_type: z.enum(MATERIAL_TYPES).optional(),
       material_color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().describe('Colour for a newly created material, e.g. "#C8A165".'),

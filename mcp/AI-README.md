@@ -233,6 +233,16 @@ SketchUp menu or a manual smoke test, not from the MCP client.
 20. **Zero move is allowed.** `ocl_move_part` with a zero offset performs no
     operation but returns the current world bounds and instance positions; it is
     the cheapest "where is this part?" query.
+21. **Definitions are reused by default.** `_mcp_prepare_box_definition`
+    matches an existing definition by name and local length/width/thickness
+    (tolerance 0.5 mm). A match reuses it, so `PartDef.generate_part_id` (which
+    includes the definition UUID) produces the same OCL part and the instances
+    merge into one cutlist line. On reuse, only the OCL UUID is ensured; tags and
+    orientation flags are definition-level and intentionally preserved (a
+    differing requested tag set is warned). A name match with different
+    dimensions creates a uniquely named definition and warns. Material is per
+    instance, so OCL still splits by material. `count_axis` offsets copies along
+    world X/Y/Z (default X).
 
 ## What changed in the existing OpenCutList code
 
@@ -318,6 +328,20 @@ Camera tests (same session, 600×400×18 box at the origin):
 - Explicit camera eye `[1200,-1200,900]`, target `[300,200,9]`,
   `perspective: false`: metadata reports the exact eye/target, orthographic
   height `1190.457 mm`, and the expected orthographic image.
+
+Cutlist-merging tests (same session, 360×545×18 shelves):
+
+- One call `count: 3, count_axis: "z", spacing_mm: 300` produced one part with
+  `count: 3`, bounds z `0..618`, positions z `0/300/600`.
+- Three separate calls at z `0/300/600` reused the definition and raised the
+  same part's count `1 → 2 → 3`.
+- A same-name call with length 400 (different from 360) created
+  `MCP Merge Shelf (2)` and warned about the dimension mismatch.
+- `reuse_definition: false` created `MCP No Reuse` and `MCP No Reuse (2)`,
+  each with `count: 1`.
+- Note: the raw bridge was used for `count_axis`/`reuse_definition` because the
+  session's MCP client still had the camera-era tool schema cached; the Node
+  server code contains the new fields and a fresh MCP connection picks them up.
 
 ## Known limitations / future work
 

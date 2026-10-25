@@ -226,6 +226,13 @@ module Ladb::OpenCutList
       spacing = (p[:spacing_mm] || 0).to_f
       raise McpError.new('invalid_params', 'spacing_mm must be >= 0.') if spacing < 0
 
+      reuse_definition = p[:reuse_definition] != false
+      count_axis = (p[:count_axis] || 'x').to_s.downcase
+      unless %w(x y z).include?(count_axis)
+        raise McpError.new('invalid_params', "count_axis must be 'x', 'y' or 'z'.")
+      end
+      axis_index = { 'x' => 0, 'y' => 1, 'z' => 2 }[count_axis]
+
       tags = Array(p[:tags]).map(&:to_s)
 
       warnings = []
@@ -253,24 +260,29 @@ module Ladb::OpenCutList
         end
       end
 
-      warnings << 'count is greater than 1 and spacing_mm is 0: the copies overlap.' if count > 1 && spacing == 0
+      warnings << "count is greater than 1 and spacing_mm is 0: the copies overlap along #{count_axis}." if count > 1 && spacing == 0
 
       container_entities = _mcp_container_entities(model, p[:container_id])
       created_entities = []
+      definition = nil
+      reused_definition = false
 
       model.start_operation('OCL MCP: Create Part', true)
       begin
-        definition = _mcp_create_box_definition(
+        definition, reused_definition, definition_warnings = _mcp_prepare_box_definition(
           model,
-          _mcp_unique_definition_name(model, name),
+          name,
           length.mm,
           width.mm,
           thickness.mm,
-          tags
+          tags,
+          reuse_definition
         )
+        warnings.concat(definition_warnings)
 
         count.times do |index|
-          copy_position = [ position[0].to_f + index * spacing, position[1].to_f, position[2].to_f ]
+          copy_position = [ position[0].to_f, position[1].to_f, position[2].to_f ]
+          copy_position[axis_index] += index * spacing
           transformation = _mcp_instance_transformation(copy_position, rotation)
           instance = container_entities.add_instance(definition, transformation)
           raise McpError.new('create_failed', 'Failed to add the part instance.') if instance.nil?
@@ -296,6 +308,9 @@ module Ladb::OpenCutList
 
       result = {
         :created_entity_ids => entity_ids,
+        :created_instance_count => created_entities.length,
+        :definition_id => definition.nil? ? nil : definition.name,
+        :reused_definition => reused_definition,
         :warnings => warnings
       }
       if part.nil?

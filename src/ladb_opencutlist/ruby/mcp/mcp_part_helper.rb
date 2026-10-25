@@ -100,6 +100,54 @@ module Ladb::OpenCutList
       definition
     end
 
+    # Local dimension match tolerance for definition reuse.
+    DEFINITION_SIZE_TOLERANCE = 0.5.mm
+
+    def _mcp_definition_dimensions_match?(definition, length, width, thickness)
+      bounds = definition.bounds
+      return false if bounds.nil?
+
+      (bounds.width - length).abs <= DEFINITION_SIZE_TOLERANCE &&
+        (bounds.height - width).abs <= DEFINITION_SIZE_TOLERANCE &&
+        (bounds.depth - thickness).abs <= DEFINITION_SIZE_TOLERANCE
+    end
+
+    # Returns [definition, reused, warnings].
+    #
+    # With reuse_definition, a definition with the same name and the same
+    # local length/width/thickness is reused, so OpenCutList merges the new
+    # instances into the existing cutlist line. Tags and orientation flags are
+    # definition-level properties: a reused definition keeps them, and a
+    # differing tag set is reported as a warning.
+    def _mcp_prepare_box_definition(model, name, length, width, thickness, tags, reuse_definition)
+      warnings = []
+
+      if reuse_definition
+        existing = model.definitions[name]
+        if existing
+          if _mcp_definition_dimensions_match?(existing, length, width, thickness)
+            # Ensure a stable OCL UUID without touching the definition's tags
+            # or orientation attributes.
+            DefinitionAttributes.new(existing).uuid
+
+            existing_tags = Array(DefinitionAttributes.new(existing).tags).map(&:to_s).sort
+            requested_tags = Array(tags).map(&:to_s).sort
+            if !requested_tags.empty? && requested_tags != existing_tags
+              warnings << "Reused definition '#{existing.name}' keeps its existing tags #{existing_tags.inspect}; requested tags #{requested_tags.inspect} were not applied."
+            end
+
+            return [ existing, true, warnings ]
+          end
+
+          warnings << "Definition '#{name}' exists with different dimensions; created a separate definition."
+        end
+      end
+
+      definition_name = _mcp_unique_definition_name(model, name)
+      definition = _mcp_create_box_definition(model, definition_name, length, width, thickness, tags)
+      [ definition, false, warnings ]
+    end
+
     # position_mm: [x, y, z] in millimetres.
     # rotation_deg: [rx, ry, rz] in degrees, applied about the definition origin.
     def _mcp_instance_transformation(position_mm, rotation_deg)
