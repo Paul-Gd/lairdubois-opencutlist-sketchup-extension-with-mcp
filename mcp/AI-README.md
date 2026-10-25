@@ -51,7 +51,7 @@ The bridge is **off by default**. The user starts it from
 |---|---|
 | `src/ladb_opencutlist/ruby/mcp/mcp_bridge_server.rb` | TCP listener, discovery file, token auth, newline JSON framing, non-blocking pump, start/stop |
 | `src/ladb_opencutlist/ruby/mcp/mcp_controller.rb` | Registers `mcp_*` commands; parts/materials/cutlist handlers; undo wrapping |
-| `src/ladb_opencutlist/ruby/mcp/mcp_part_helper.rb` | Box creation, face-role mapping, resize/move/erase helpers, mm helpers |
+| `src/ladb_opencutlist/ruby/mcp/mcp_part_helper.rb` | Box/cylinder creation, face-role mapping, resize/move/erase helpers, solid DrawingDef/attribute copying, mm helpers |
 | `src/ladb_opencutlist/ruby/mcp/mcp_error.rb` | `McpError(code, message)` for structured bridge errors |
 | `src/ladb_opencutlist/ruby/plugin.rb` | Requires/pushes `McpController`; adds the MCP Bridge menu; stops the bridge |
 | `src/ladb_opencutlist/ruby/observer/app_observer.rb` | Stops the bridge on SketchUp quit |
@@ -109,6 +109,7 @@ is single-threaded.
 | `ocl_delete_part` | `mcp_part_delete` | destructive |
 | `ocl_select_parts` | `mcp_parts_select` | write (selection) |
 | `ocl_create_group` | `mcp_create_group` | write (grouping) |
+| `ocl_solid_operation` | `mcp_solid_operation` | write (boolean solid) |
 | `ocl_set_parts_visibility` | `mcp_parts_visibility` | write (hide/show) |
 | `ocl_screenshot` | `mcp_screenshot` | view capture |
 | `ocl_create_material` | `mcp_material_create` | write |
@@ -245,7 +246,44 @@ SketchUp menu or a manual smoke test, not from the MCP client.
     a uniquely named definition and warns. Material is per instance, so OCL
     still splits by material. `count_axis` offsets copies along world X/Y/Z
     (default X).
-22. **Groups are containers; cylinders are Z-oriented.** `mcp_create_group`
+22. **Solid operations reuse OCL's Meshy workers.** `mcp_solid_operation`
+    builds one `DrawingDef` per operand with
+    `CommonDrawingDecompositionWorker` (`flatten: false`,
+    `CONTAINER_VALIDATOR_PART_WITHOUT_MACHININGS`, the same parameters as
+    `SmartActionHandlerSolidBooleanHelper`), then calls
+    `CommonSolidBooleanApplyWorker` with `wrap_operation: false` inside the
+    controller's own undo operation. Never call the raw SketchUp
+    `Group#union/#subtract/...` methods here: they lose OCL attributes and do
+    not handle shared definitions, nested containers or glued machinings.
+    Operands are individual **instances**; `part_ids` is accepted only when a
+    part has exactly one instance, otherwise `entity_ids` is required. All
+    operands must share a parent container. The first operand is the target.
+    `trim` is subtraction with `keep_cuts: true`; `outer_shell` is an alias of
+    union (Meshy's union is already a manifold outer shell). `split` computes
+    target−tool, tool−target and intersection with
+    `CommonSolidBooleanWorker` **before** touching the model, then applies each
+    with `keep_srcs: true, keep_cuts: true, result_def: <precomputed>` and
+    erases both sources at the end. `created_entities` identifies the result
+    containers; parts are re-found from a fresh cutlist. A made-unique definition
+    inherits a **copy** of the source OCL definition attributes, including its
+    UUID; `_mcp_copy_definition_attributes` therefore copies the
+    DefinitionAttributes plus SketchUp's `definition.description` and assigns
+    a fresh UUID (two definitions sharing a UUID are one OCL part). Split
+    results get attributes from their source piece and are renamed with a role
+    suffix. The target's material/layer is restored on the result.
+    **Result naming:** OCL takes component part names from the definition
+    name. Before a non-split boolean, `_mcp_free_solid_result_name` renames the
+    target definition to a temporary unique name (`Shelf [MCP solid 123]`), so
+    the worker's clone/rebuild can take the original name without SketchUp
+    appending `#1`. After the operation, `_mcp_prepare_solid_result_identity`
+    either restores the source name (it still has non-operand instances; the
+    result becomes `Shelf (solid)`) or the unused source definition is removed
+    (the result takes `Shelf`). Everything happens inside the same undo
+    operation. Renaming *after* removing the source but still inside the
+    operation is not enough: SketchUp keeps the removed definition's name
+    reserved until the operation commits. `trim` also returns
+    `kept_part_ids` for the rebuilt target and the kept tools.
+23. **Groups are containers; cylinders are X-oriented.** `mcp_create_group`
     uses `Entities#add_group(entities)` on siblings. All member entities must
     share the same parent collection (same model root or same group); OCL
     traverses the resulting `Sketchup::Group` as a container and does not count
@@ -366,19 +404,55 @@ Groups/cylinders tests (same session):
   returned, cutlist still three lines (rail count 2 + A + B), and the boxes'
   instance paths read `MCP Test Group` (serialized paths include the group id).
 
+Solid-operation tests (2026-10-25, final build):
+
+- Two 500³ boxes offset by 250 → `union`: one 750³ part, bounds
+  `0..750` on all axes, name `MCP Name A` (no `#1`), target tags preserved,
+  tool erased.
+- `subtract`: target bounds unchanged, tool erased. `intersect` of 300³ and
+  200³ boxes offset by 150 → 150³ at `[3150,150,150]`.
+- `trim`: target rebuilt, tool kept, both remain as parts; response
+  `kept_part_ids` includes both.
+- `split` of 300³ and 200³ offset by 150 → three parts named
+  `<source> (target minus tool)`, `<source> (tool minus target)`,
+  `<source> (intersection)` with bounds 300³ / 200³ / 150³; source parts gone.
+  Tags, description (`Split description`) and price (`7.5`) copied to the
+  target-side pieces.
+- Fully contained `subtract` → empty result, both operands erased, warning
+  `The operation produced an empty solid`, no leftover definition.
+- `part_ids` on a two-instance part → `ambiguous_part_instances`; the same part
+  unioned through its two `entity_ids` merged into one 300×200×200 part.
+- Operands in different containers → `different_parents`; union of two parts
+  inside a group kept the group path and produced one named part.
+- Target definition shared with a non-operand instance: the result became
+  `MCP Name I (solid)` at the operated instance, while the untouched instance
+  kept `MCP Name I` at its original bounds.
+- Sheet-good part with 2 mm edge banding on `ymin`/`ymax` (`edge_count: 2`,
+  `1010`) kept both edge materials after `subtract`; a part without a
+  sheet-good body material does not get OCL edge detection (OCL behavior, not
+  the boolean).
+
 ## Known limitations / future work
 
-- `ocl_create_part` creates rectangular boxes only. Smart Draw supports
-  rectangles, circles, polygons, arbitrary planes and construction geometry;
-  its creation path is coupled to interactive tool state
+- `ocl_create_part` creates rectangular boxes and X-axis cylinders only. Smart
+  Draw supports polygons, arbitrary planes and construction geometry; its
+  creation path is coupled to interactive tool state
   (`smart_draw_tool.rb:1544-1673`), so reusing it needs a dedicated worker.
-- No material update/delete MCP tool (create/list only). The UI can purge
-  unused materials.
+- Solid operations accept only OCL parts that are manifold solids and share
+  one container. A part with several instances must be addressed through
+  `entity_ids`. There is no `keep_target` option: `trim` is the way to keep
+  the tool, and `split` is the way to keep both sides of the difference.
+  `outer_shell` is an alias of `union`; Meshy does not expose a separate
+  inner-face-preserving union.
+- Solid operations do not recreate edge banding/veneer on newly cut faces.
+  Materials on surviving faces are preserved by the worker. Apply finishing
+  with `ocl_update_part` after the operation.
 - No part thumbnails (the viewport screenshot is the visual tool), batch part
   update, group editing/ungrouping, outliner, export or packing tools. Groups
   can be created only from parts that already share a container.
 - Cylinders support length/diameter only; edge banding/veneers are not
-  meaningful on them. Boxes remain the only shape with edge/face roles.
+  meaningful on them. Boxes remain the only shape with oriented edge/face
+  roles.
 - Screenshot isolation only hides siblings along the target paths; it cannot
   isolate inside a shared component definition without temporarily affecting
   other instances of that definition (restored afterwards). Captures use the

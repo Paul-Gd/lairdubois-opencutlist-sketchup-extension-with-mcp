@@ -5,6 +5,8 @@ module Ladb::OpenCutList
 
   require_relative '../model/attributes/definition_attributes'
   require_relative '../model/attributes/material_attributes'
+  require_relative '../model/drawing/drawing_def'
+  require_relative '../worker/common/common_drawing_decomposition_worker'
 
   # Geometry helpers used by the MCP controller.
   #
@@ -13,6 +15,19 @@ module Ladb::OpenCutList
   module McpPartHelper
 
     MAX_DIMENSION_MM = 100_000.0
+
+    # Same decomposition the Smart tools give to CommonSolidBooleanApplyWorker:
+    # keep the container tree and leave the parts' own glued machinings out of
+    # the operands (see SmartActionHandlerSolidBooleanHelper).
+    SOLID_BOOLEAN_DRAWING_DEF_PARAMETERS = {
+      ignore_surfaces: true,
+      ignore_faces: false,
+      ignore_edges: true,
+      ignore_soft_edges: true,
+      ignore_clines: true,
+      container_validator: CommonDrawingDecompositionWorker::CONTAINER_VALIDATOR_PART_WITHOUT_MACHININGS,
+      flatten: false
+    }.freeze
 
     DEFAULT_MATERIAL_COLORS = %w(
       #4F78A7 #EF8E2C #DE545A #79B8B2 #5CA34D
@@ -402,6 +417,43 @@ module Ladb::OpenCutList
       end
 
       ids
+    end
+
+    # Builds the DrawingDef of one part instance for the boolean workers.
+    # The instance path is what OCL recorded for the part, so nested parts and
+    # parts displayed through a shared component work like in the Smart tools.
+    def _mcp_solid_drawing_def(instance_info)
+      path = Sketchup::InstancePath.new(instance_info.path)
+      drawing_def = CommonDrawingDecompositionWorker.new(
+        [path],
+        **SOLID_BOOLEAN_DRAWING_DEF_PARAMETERS
+      ).run
+
+      drawing_def.is_a?(DrawingDef) ? drawing_def : nil
+    end
+
+    # Copies the OpenCutList definition attributes onto a definition the
+    # boolean worker created (split pieces, made-unique clones). A new UUID is
+    # mandatory: OCL treats two definitions sharing a UUID as the same part.
+    def _mcp_copy_definition_attributes(source_definition, target_definition)
+      return if source_definition.nil? || target_definition.nil? || source_definition == target_definition
+
+      target_definition.description = source_definition.description if source_definition.respond_to?(:description) && target_definition.respond_to?(:description=)
+
+      source = DefinitionAttributes.new(source_definition)
+      target = DefinitionAttributes.new(target_definition)
+
+      [
+        :url, :tags, :cumulable, :mass, :price,
+        :length_increase, :width_increase, :thickness_increase,
+        :symmetrical, :ignore_grain_direction, :follow_grain_direction,
+        :orientation_locked_on_axis, :thickness_layer_count, :role
+      ].each do |attribute|
+        target.send("#{attribute}=", source.send(attribute))
+      end
+
+      target.uuid = SecureRandom.uuid
+      target.write_to_attributes
     end
 
     # Groups sibling entities into a new SketchUp group. OCL traverses groups

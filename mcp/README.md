@@ -66,6 +66,7 @@ returned id or call `ocl_list_parts` again.
 | `ocl_move_part` | write | Translate all instances |
 | `ocl_select_parts` | write | Select parts in SketchUp |
 | `ocl_create_group` | write | Group parts into a SketchUp group |
+| `ocl_solid_operation` | write | Boolean solid union/subtract/intersect/trim/split |
 | `ocl_set_parts_visibility` | write | Hide or show parts |
 | `ocl_screenshot` | read | PNG of the viewport, optionally isolated to chosen parts |
 | `ocl_delete_part` | destructive | Delete all instances (requires `confirm: true`) |
@@ -151,6 +152,50 @@ merged `count`. Set `reuse_definition: false` to force a new definition.
   `width_mm`/`thickness_mm` are ignored for cylinders. Edge banding and veneers
   are box-oriented and not meaningful on a cylinder.
 
+#### Solid operations
+
+`ocl_solid_operation` runs the same Meshy-based boolean engine as
+OpenCutList's Smart tools. Operands must be **manifold solids in the same
+container** (model root or the same group). They are ordered: the first is the
+target, the rest are tools.
+
+| `operation` | Result | Tools |
+|---|---|---|
+| `union` | all operands merged into one solid | consumed |
+| `outer_shell` | alias of `union`; the union already removes interior faces | consumed |
+| `subtract` | first operand minus every tool | consumed |
+| `intersect` | volume common to the first operand and all tools | consumed |
+| `trim` | first operand minus every tool | **kept** |
+| `split` | exactly two operands → target-minus-tool, tool-minus-target, intersection | replaced |
+
+- Pass `part_ids` only when every part has **one instance**. If a part has
+  several copies, pass explicit `entity_ids` from
+  `ocl_get_part` → `instances[].entity_id`; otherwise the call fails with
+  `ambiguous_part_instances` instead of guessing.
+- The result keeps the target's name, material, layer, tags, description,
+  price and other OCL definition attributes. `name` overrides the result name.
+  Split pieces are named `"<source> (target minus tool)"`,
+  `"<source> (tool minus target)"` and `"<source> (intersection)"`.
+- If the target definition is still displayed by instances that were not part
+  of the operation, those instances keep the original name and the result is
+  named `"<name> (solid)"`; SketchUp cannot give two definitions the same name.
+  Source definitions left with no instance are removed.
+- Materials on surviving faces are preserved, including edge banding on
+  sheet-good parts (OCL only detects edge banding when the body material is
+  sheet good). Newly created cut faces have no edge banding or veneer; apply it
+  afterwards with `ocl_update_part`.
+- For `trim`, the response includes `kept_part_ids` with both the rebuilt target
+  and the kept tools.
+- One call is one SketchUp undo step. The response returns fresh
+  `result_part_ids` (one part, several parts if the union has disjoint lumps,
+  or up to three for `split`). An empty piece (for example an empty
+  intersection) is reported with `empty: true` and creates no part.
+- Parts with locked instances, non-manifold geometry (open edges, no volume)
+  or unsupported geometry fail with OpenCutList's own validation message and
+  leave the model unchanged.
+- Union/outer shell of disjoint solids may produce several result parts rather
+  than one container; the response lists all of them.
+
 #### Material semantics
 
 - `ocl_create_part` creates a missing material automatically and reports it in
@@ -214,6 +259,10 @@ returned id for later calls.
 - “Create three identical 360 × 545 × 18 shelves, 300 mm apart in Z.”
 - “Create a 756 mm long, 25 mm diameter rail at the top of the wardrobe.”
 - “Group the two side panels and the shelf under ‘Carcass’.”
+- “Union these two intersecting rails into one part.”
+- “Subtract the mortise block from the leg and keep the block.”
+- “Trim the shelf against the side panel.”
+- “Split the panel where it meets the rail and list the three pieces.”
 - “Create an edge material called Oak edge, 2 mm, type edge.”
 - “Give the shelf a 2 mm edge on ymin and ymax.”
 - “Resize the shelf to 800 × 400 × 18.”

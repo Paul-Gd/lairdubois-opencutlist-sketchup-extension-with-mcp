@@ -6,6 +6,10 @@ module Ladb::OpenCutList
   require_relative '../mcp/mcp_part_helper'
   require_relative '../worker/cutlist/cutlist_generate_worker'
   require_relative '../worker/cutlist/cutlist_part_update_worker'
+  require_relative '../worker/common/common_drawing_decomposition_worker'
+  require_relative '../worker/common/common_solid_boolean_worker'
+  require_relative '../worker/common/common_solid_boolean_apply_worker'
+  require_relative '../model/drawing/drawing_def'
   require_relative '../model/cutlist/instance_info'
   require_relative '../model/attributes/definition_attributes'
   require_relative '../model/attributes/material_attributes'
@@ -37,6 +41,8 @@ module Ladb::OpenCutList
     MAX_PARTS_LIMIT = 1000
     MAX_PART_COUNT = 1000
 
+    SOLID_OPERATIONS = %w(union subtract intersect trim split outer_shell).freeze
+
     def initialize
       super('mcp')
       @bridge_server = nil
@@ -64,6 +70,7 @@ module Ladb::OpenCutList
       PLUGIN.register_command('mcp_parts_select') { |params| parts_select_command(params) }
       PLUGIN.register_command('mcp_parts_visibility') { |params| parts_visibility_command(params) }
       PLUGIN.register_command('mcp_create_group') { |params| group_create_command(params) }
+      PLUGIN.register_command('mcp_solid_operation') { |params| solid_operation_command(params) }
       PLUGIN.register_command('mcp_screenshot') { |params| screenshot_command(params) }
 
       # Materials
@@ -775,6 +782,519 @@ module Ladb::OpenCutList
         :part_count => parts.length,
         :member_entity_ids => entities.map { |entity| entity.entityID },
         :bounds_mm => bounds.empty? ? nil : _mcp_bounds_mm(bounds)
+      }
+    end
+
+    # Runs a boolean solid operation on OpenCutList parts.
+    #
+    # Operands are instances, not part definitions: a part with several copies
+    # must be addressed through entity_ids. All operands must be in the same
+    # container. The first operand is the target; the others are tools. The
+    # operation uses OpenCutList's own Meshy-based boolean workers, so locked
+    # instances, non-manifold solids and nested containers are handled exactly
+    # like the Smart tools do.
+    def solid_operation_command(params)
+      p = _deep_symbolize(params || {})
+      model = _require_model
+
+      operation = p[:operation].to_s.strip.downcase
+      unless SOLID_OPERATIONS.include?(operation)
+        raise McpError.new('invalid_params', "operation must be one of: #{SOLID_OPERATIONS.join(', ')}.")
+      end
+
+      cutlist = _cutlist
+      operands = _mcp_solid_operands(model, cutlist, p)
+      if operation == 'split' && operands.length != 2
+        raise McpError.new('invalid_params', 'split requires exactly two operands: the target and the tool.')
+      end
+
+      _mcp_require_same_solid_container(operands)
+
+      drawing_defs = operands.map do |operand|
+        drawing_def = _mcp_solid_drawing_def(operand[:instance_info])
+        if drawing_def.nil?
+          raise McpError.new(
+            'solid_operand_not_readable',
+            "OpenCutList could not read '#{operand[:part].name}' as a solid. Make sure it is a closed group or component."
+          )
+        end
+        drawing_def
+      end
+
+      result = nil
+      split_pieces = nil
+      rename_jobs = []
+      operation_label = operation.split('_').map(&:capitalize).join(' ')
+
+      model.start_operation("OCL MCP: Solid #{operation_label}", true)
+      begin
+        if operation == 'split'
+          split_pieces = _mcp_apply_solid_split(drawing_defs)
+          _mcp_copy_split_result_attributes(split_pieces, operands)
+          _mcp_erase_entities(operands.map { |operand| operand[:entity] })
+          _mcp_remove_unused_solid_definitions(model, operands, [])
+          rename_jobs = _mcp_split_rename_jobs(split_pieces, operands, p[:name])
+        else
+          # Free the target's definition name before the boolean worker clones
+          # the container, otherwise SketchUp uniquifies the clone ("Shelf" ->
+          # "Shelf#1") while the source definition still holds the name.
+          name_context = _mcp_free_solid_result_name(model, operands.first)
+          result = _mcp_apply_solid_boolean(drawing_defs, operation)
+          rename_jobs = _mcp_prepare_solid_result_identity(result, operands, p[:name], model, name_context)
+        end
+        _mcp_apply_solid_rename_jobs(rename_jobs)
+        model.commit_operation
+      rescue Exception => e
+        begin
+          model.abort_operation
+        rescue StandardError
+          # Nothing to abort.
+        end
+        raise e
+      end
+
+      cutlist = _cutlist
+      if operation == 'split'
+        _mcp_split_result_response(operation, split_pieces, operands, cutlist)
+      else
+        _mcp_boolean_result_response(operation, result, operands, cutlist)
+      end
+    end
+
+    # ---------------------------------------------------------------------
+    # Solid operation helpers
+
+    def _mcp_solid_operands(model, cutlist, p)
+      part_ids = Array(p[:part_ids]).map(&:to_s).reject(&:empty?)
+      entity_ids = Array(p[:entity_ids]).map { |id| id.to_i }.reject(&:zero?)
+
+      if !part_ids.empty? && !entity_ids.empty?
+        raise McpError.new('invalid_params', 'Provide either part_ids or entity_ids, not both.')
+      end
+      if part_ids.empty? && entity_ids.empty?
+        raise McpError.new('invalid_params', 'Provide part_ids or entity_ids with at least two operands.')
+      end
+
+      if !part_ids.empty?
+        if part_ids.length < 2
+          raise McpError.new('invalid_params', 'part_ids must contain at least two parts.')
+        end
+        part_ids.map do |part_id|
+          part = _find_part(cutlist, part_id)
+          _mcp_solid_operand_from_part(model, part)
+        end
+      else
+        entity_ids = entity_ids.uniq
+        if entity_ids.length < 2
+          raise McpError.new('invalid_params', 'entity_ids must contain at least two different entities.')
+        end
+        entity_ids.map { |entity_id| _mcp_solid_operand_from_entity(model, cutlist, entity_id) }
+      end
+    end
+
+    def _mcp_solid_operand_from_part(model, part)
+      if part.virtual
+        raise McpError.new('unsupported_entity', "Part '#{part.name}' is virtual (edge banding or veneer) and cannot take part in a solid operation.")
+      end
+
+      entity_ids = Array(part.entity_ids).map(&:to_i).uniq
+      if entity_ids.length != 1
+        raise McpError.new(
+          'ambiguous_part_instances',
+          "Part '#{part.name}' has #{entity_ids.length} instances. Use entity_ids to choose which instances take part (see ocl_get_part instances[])."
+        )
+      end
+
+      _mcp_solid_operand_from_entity(model, nil, entity_ids.first, part)
+    end
+
+    def _mcp_solid_operand_from_entity(model, cutlist, entity_id, part = nil)
+      entity = model.find_entity_by_id(entity_id)
+      if entity.nil?
+        raise McpError.new('entity_not_found', "No entity with id #{entity_id}. Call ocl_list_parts to get fresh ids.")
+      end
+      unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+        raise McpError.new('unsupported_entity', "Entity #{entity_id} is not a group or component instance.")
+      end
+      if entity.respond_to?(:visible?) && !entity.visible?
+        raise McpError.new('entity_hidden', "Entity #{entity_id} is hidden. Show it before a solid operation.")
+      end
+
+      if part.nil?
+        part = _find_part_by_entity_ids(cutlist, [entity_id])
+        if part.nil?
+          raise McpError.new('not_a_part', "Entity #{entity_id} is not an OpenCutList part. Solid operations only accept parts listed by ocl_list_parts.")
+        end
+        if part.virtual
+          raise McpError.new('unsupported_entity', "Part '#{part.name}' is virtual (edge banding or veneer) and cannot take part in a solid operation.")
+        end
+      end
+
+      instance_info = part.def.instance_infos.values.find { |info| !info.entity.nil? && info.entity.entityID == entity_id }
+      if instance_info.nil?
+        raise McpError.new('part_not_found', "Entity #{entity_id} is not an instance of part '#{part.name}'.")
+      end
+
+      {
+        :entity => entity,
+        :entity_id => entity_id,
+        :part => part,
+        :instance_info => instance_info,
+        :definition => _mcp_definition(entity),
+        :material => entity.material,
+        :layer => entity.layer
+      }
+    end
+
+    def _mcp_require_same_solid_container(operands)
+      containers = operands.map { |operand| operand[:entity].parent }
+      keys = containers.map { |container| container.is_a?(Sketchup::Model) ? :model : container.object_id }
+      if keys.uniq.length > 1
+        raise McpError.new('different_parents', 'All solid operands must be in the same container (the model root or the same group).')
+      end
+    end
+
+    def _mcp_apply_solid_boolean(drawing_defs, operation)
+      first = drawing_defs.first
+      rest = drawing_defs[1..-1] || []
+
+      result = case operation
+               when 'union', 'outer_shell'
+                 CommonSolidBooleanApplyWorker.new(
+                   drawing_defs, [],
+                   operation: CommonSolidBooleanWorker::OPERATION_UNION,
+                   wrap_operation: false
+                 ).run
+               when 'subtract'
+                 CommonSolidBooleanApplyWorker.new(
+                   [first], rest,
+                   operation: CommonSolidBooleanWorker::OPERATION_SUBTRACTION,
+                   wrap_operation: false
+                 ).run
+               when 'trim'
+                 CommonSolidBooleanApplyWorker.new(
+                   [first], rest,
+                   operation: CommonSolidBooleanWorker::OPERATION_SUBTRACTION,
+                   keep_cuts: true,
+                   wrap_operation: false
+                 ).run
+               when 'intersect'
+                 CommonSolidBooleanApplyWorker.new(
+                   [first], rest,
+                   operation: CommonSolidBooleanWorker::OPERATION_INTERSECTION,
+                   wrap_operation: false
+                 ).run
+               else
+                 raise McpError.new('invalid_params', "Unsupported solid operation '#{operation}'.")
+               end
+
+      unless result.success?
+        raise McpError.new('solid_operation_failed', _mcp_solid_error_message(result))
+      end
+
+      result
+    end
+
+    # Split is three independent boolean results on the same pair:
+    # target - tool, tool - target and target ∩ tool. Compute all three
+    # before touching the model, then apply each in keep_srcs mode so the
+    # operands survive until every piece has been rebuilt.
+    def _mcp_apply_solid_split(drawing_defs)
+      target, tool = drawing_defs
+      pieces = [
+        {
+          :role => 'target_minus_tool',
+          :source_index => 0,
+          :src => [target],
+          :cut => [tool],
+          :operation => CommonSolidBooleanWorker::OPERATION_SUBTRACTION
+        },
+        {
+          :role => 'tool_minus_target',
+          :source_index => 1,
+          :src => [tool],
+          :cut => [target],
+          :operation => CommonSolidBooleanWorker::OPERATION_SUBTRACTION
+        },
+        {
+          :role => 'intersection',
+          :source_index => 0,
+          :src => [target],
+          :cut => [tool],
+          :operation => CommonSolidBooleanWorker::OPERATION_INTERSECTION
+        }
+      ]
+
+      pieces.each do |piece|
+        piece[:computed] = CommonSolidBooleanWorker.new(
+          piece[:src], piece[:cut],
+          operation: piece[:operation]
+        ).run
+        unless piece[:computed].success?
+          raise McpError.new('solid_operation_failed', _mcp_solid_error_message(piece[:computed]))
+        end
+      end
+
+      pieces.each do |piece|
+        next if piece[:computed].fragment_defs.empty?
+
+        piece[:applied] = CommonSolidBooleanApplyWorker.new(
+          piece[:src], piece[:cut],
+          operation: piece[:operation],
+          result_def: piece[:computed],
+          keep_srcs: true,
+          keep_cuts: true,
+          wrap_operation: false
+        ).run
+        unless piece[:applied].success?
+          raise McpError.new('solid_operation_failed', _mcp_solid_error_message(piece[:applied]))
+        end
+      end
+
+      pieces
+    end
+
+    def _mcp_copy_split_result_attributes(pieces, operands)
+      pieces.each do |piece|
+        applied = piece[:applied]
+        next if applied.nil?
+
+        source_operand = operands[piece[:source_index]]
+        containers = Array(applied.created_entities).select { |entity| entity.respond_to?(:definition) }
+        containers.each do |entity|
+          _mcp_copy_definition_attributes(source_operand[:definition], _mcp_definition(entity))
+          _mcp_copy_solid_result_appearance(entity, source_operand[:material], source_operand[:layer])
+        end
+      end
+    end
+
+    def _mcp_split_rename_jobs(pieces, operands, name)
+      jobs = []
+      pieces.each do |piece|
+        applied = piece[:applied]
+        next if applied.nil?
+
+        source_operand = operands[piece[:source_index]]
+        containers = Array(applied.created_entities).select { |entity| entity.respond_to?(:definition) }
+        containers.each_with_index do |entity, index|
+          base_name = name || source_operand[:part].name
+          suffix = piece[:role].tr('_', ' ')
+          suffix = "#{suffix} #{index + 1}" if index > 0
+          jobs << { :entity => entity, :name => "#{base_name} (#{suffix})" }
+        end
+      end
+      jobs
+    end
+
+    # Renames the target definition to a temporary unique name so the boolean
+    # worker's clone can take the original name back. SketchUp will not allow
+    # two definitions to share a name and suffixes the clone instead.
+    def _mcp_free_solid_result_name(model, source_operand)
+      definition = source_operand[:definition]
+      original_name = source_operand[:part].name.to_s
+      context = { :definition => definition, :original_name => original_name, :renamed => false }
+      return context if definition.nil? || original_name.empty?
+
+      temp_name = _mcp_unique_definition_name(model, "#{original_name} [MCP solid #{source_operand[:entity_id]}]")
+      begin
+        definition.name = temp_name
+        context[:renamed] = true
+      rescue StandardError
+        # The result keeps SketchUp's unique suffix if the source name cannot
+        # be freed.
+      end
+      context
+    end
+
+    def _mcp_prepare_solid_result_identity(result_def, operands, name, model, name_context)
+      source_operand = operands.first
+      source_definition = source_operand[:definition]
+      containers = Array(result_def.created_entities).select { |entity| entity.respond_to?(:definition) }
+
+      result_definitions = containers.map { |entity| _mcp_definition(entity) }.compact.uniq
+
+      containers.each do |entity|
+        definition = _mcp_definition(entity)
+        # A made-unique clone keeps a copy of the source definition attributes,
+        # including its UUID. Two definitions sharing a UUID are one part to
+        # OCL, so a clone gets fresh attributes and a fresh UUID.
+        _mcp_copy_definition_attributes(source_definition, definition) if definition != source_definition
+      end
+
+      # The source definition may still be displayed by instances outside this
+      # operation. Restore its original name before naming the result; in that
+      # case the result is a new part and must take a distinguishable name.
+      source_in_use = false
+      if name_context[:renamed] && !source_definition.nil? && !result_definitions.include?(source_definition)
+        begin
+          if model.definitions.include?(source_definition) && source_definition.count_used_instances > 0
+            source_definition.name = name_context[:original_name]
+            source_in_use = true
+          end
+        rescue StandardError
+          # Keep the boolean worker's naming if the source definition is gone.
+        end
+      end
+
+      _mcp_remove_unused_solid_definitions(model, operands, result_definitions)
+      return [] if containers.empty?
+
+      containers.each_with_index.map do |entity, index|
+        base_name = name || name_context[:original_name]
+        base_name = source_operand[:part].name if base_name.to_s.empty?
+        desired_name = source_in_use && name.nil? ? "#{base_name} (solid)" : base_name
+        desired_name = "#{desired_name} (#{index + 1})" if name.nil? && containers.length > 1 && index > 0
+        _mcp_copy_solid_result_appearance(entity, source_operand[:material], source_operand[:layer])
+        { :entity => entity, :name => desired_name }
+      end
+    end
+
+    def _mcp_apply_solid_rename_jobs(jobs)
+      jobs.each { |job| _mcp_rename_entity_and_definition(job[:entity], job[:name]) }
+    end
+
+    # Removes source definitions that no longer have any instance after a
+    # boolean operation (the target/tool containers are rebuilt or erased).
+    # Definitions still displayed by other instances are kept.
+    def _mcp_remove_unused_solid_definitions(model, operands, keep_definitions)
+      operands.map { |operand| operand[:definition] }.compact.uniq.each do |definition|
+        next if keep_definitions.include?(definition)
+        next unless definition.respond_to?(:count_used_instances)
+        next unless definition.count_used_instances.zero?
+
+        begin
+          model.definitions.remove(definition)
+        rescue StandardError
+          # Leaving an unused definition behind is harmless.
+        end
+      end
+    end
+
+    def _mcp_rename_entity_and_definition(entity, name)
+      return if name.nil? || name.to_s.strip.empty?
+
+      definition = _mcp_definition(entity)
+      if definition.respond_to?(:name=)
+        model = definition.respond_to?(:model) ? definition.model : nil
+        unless model.nil?
+          existing = model.definitions[name]
+          if !existing.nil? && existing != definition && existing.respond_to?(:count_used_instances) && existing.count_used_instances.zero?
+            begin
+              model.definitions.remove(existing)
+            rescue StandardError
+              # If it cannot be removed, SketchUp will suffix the result name.
+            end
+          end
+        end
+
+        definition.name = name
+      end
+
+      # For groups OCL reads the instance name; for components it reads the
+      # definition name. Do not set an instance name on components: it is not
+      # what OCL displays and it can interfere with definition uniquification.
+      entity.name = name if entity.is_a?(Sketchup::Group) && entity.respond_to?(:name=)
+    end
+
+    def _mcp_copy_solid_result_appearance(entity, material, layer)
+      begin
+        entity.material = material if entity.respond_to?(:material=)
+      rescue StandardError
+        # Material assignment is best effort.
+      end
+      begin
+        entity.layer = layer if entity.respond_to?(:layer=) && !layer.nil?
+      rescue StandardError
+        # Keep the layer chosen by the boolean worker.
+      end
+    end
+
+    def _mcp_solid_error_message(result_def)
+      messages = Array(result_def.errors).map do |error|
+        if error.is_a?(Array)
+          PLUGIN.get_i18n_string(error[0], error[1])
+        else
+          PLUGIN.get_i18n_string(error.to_s)
+        end
+      end.uniq
+
+      messages = ['the operands must be manifold solids'] if messages.empty?
+      "Solid operation failed: #{messages.join(' ')}"
+    end
+
+    def _mcp_parts_for_entity_ids(cutlist, entity_ids)
+      ids = Array(entity_ids).map(&:to_i)
+      return [] if ids.empty?
+
+      cutlist.get_parts.select { |part| (Array(part.entity_ids).map(&:to_i) & ids).any? }
+    end
+
+    def _mcp_boolean_result_response(operation, result_def, operands, cutlist)
+      entity_ids = Array(result_def.created_entities).map { |entity| entity.respond_to?(:entityID) ? entity.entityID : nil }.compact
+      parts = _mcp_parts_for_entity_ids(cutlist, entity_ids)
+
+      warnings = []
+      if Array(result_def.created_entities).empty?
+        warnings << 'The operation produced an empty solid; no part was created.'
+      elsif parts.empty?
+        warnings << 'The solid result was created but OpenCutList does not recognize it as a part. Check that it is a closed solid.'
+      end
+      if operation == 'outer_shell'
+        warnings << 'outer_shell is an alias of union here: the union already removes interior faces, so it returns an outer shell.'
+      end
+
+      kept_parts = if operation == 'trim'
+                     operands.select { |operand| operand[:entity].valid? }
+                             .flat_map { |operand| _mcp_parts_for_entity_ids(cutlist, [operand[:entity_id]]) }
+                             .uniq { |part| part.id }
+                   else
+                     []
+                   end
+
+      {
+        :operation => operation,
+        :result_part_ids => parts.map(&:id),
+        :result_entity_ids => entity_ids,
+        :results => parts.map { |part| _part_summary(part) },
+        :kept_part_ids => kept_parts.map(&:id),
+        :operand_entity_ids => operands.map { |operand| operand[:entity_id] },
+        :kept_operand_entity_ids => operands.select { |operand| operand[:entity].valid? }.map { |operand| operand[:entity_id] },
+        :removed_operand_entity_ids => operands.reject { |operand| operand[:entity].valid? }.map { |operand| operand[:entity_id] },
+        :warnings => warnings
+      }
+    end
+
+    def _mcp_split_result_response(operation, pieces, operands, cutlist)
+      entries = pieces.map do |piece|
+        applied = piece[:applied]
+        entity_ids = applied.nil? ? [] : Array(applied.created_entities).map { |entity| entity.respond_to?(:entityID) ? entity.entityID : nil }.compact
+        part = nil
+        entity_ids.each { |entity_id| part ||= _find_part_by_entity_ids(cutlist, [entity_id]) }
+
+        {
+          :role => piece[:role],
+          :empty => applied.nil?,
+          :result_part_id => part.nil? ? nil : part.id,
+          :result_entity_ids => entity_ids,
+          :part => part.nil? ? nil : _part_summary(part)
+        }
+      end
+
+      warnings = []
+      if entries.any? { |entry| entry[:empty] }
+        warnings << 'An empty piece produces no part (for example when the intersection is empty).'
+      end
+      if entries.select { |entry| !entry[:empty] }.any? { |entry| entry[:part].nil? }
+        warnings << 'A split piece was created but OpenCutList does not recognize it as a part. Check that it is a closed solid.'
+      end
+
+      {
+        :operation => operation,
+        :results => entries,
+        :result_part_ids => entries.map { |entry| entry[:result_part_id] }.compact,
+        :result_entity_ids => entries.flat_map { |entry| entry[:result_entity_ids] },
+        :operand_entity_ids => operands.map { |operand| operand[:entity_id] },
+        :warnings => warnings
       }
     end
 

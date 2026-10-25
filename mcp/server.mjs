@@ -265,6 +265,31 @@ function registerTools(server) {
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
   }, 'mcp_create_group', { timeoutMs: 120000 });
 
+  registerTool(server, 'ocl_solid_operation', {
+    description:
+      'Run a boolean solid operation on OpenCutList parts: union, subtract, intersect, trim, split or outer_shell. ' +
+      'Operands are ordered: the first is the target, the others are tools. union/outer_shell combine all operands; ' +
+      'subtract removes the tools from the target; intersect keeps the common volume; trim subtracts but keeps the tools; ' +
+      'split (exactly two operands) returns target-minus-tool, tool-minus-target and the intersection. ' +
+      'All operands must be manifold solids in the same container (model root or the same group). ' +
+      'Use part_ids when each part has exactly one instance; if a part has several copies, pass explicit entity_ids from ' +
+      'ocl_get_part instances[].entity_id. Operands are consumed (trim keeps the tools) and one undo step restores everything. ' +
+      'The response returns fresh result part_ids. Materials on surviving faces are preserved; newly created cut faces have no edge banding or veneer.',
+    inputSchema: z.object({
+      operation: z.enum(['union', 'subtract', 'intersect', 'trim', 'split', 'outer_shell']),
+      part_ids: z.array(z.string().min(1)).min(2).optional(),
+      entity_ids: z.array(z.number().int()).min(2).optional(),
+      name: z.string().min(1).optional().describe('Optional result name. Without it the target name is kept (split pieces keep their source names).')
+    }).refine((value) => (value.part_ids?.length ?? 0) > 0 || (value.entity_ids?.length ?? 0) > 0, {
+      message: 'Provide part_ids or entity_ids with at least two operands.'
+    }).refine((value) => !(value.part_ids && value.entity_ids), {
+      message: 'Use either part_ids or entity_ids, not both.'
+    }).refine((value) => value.operation !== 'split' || ((value.part_ids?.length ?? value.entity_ids?.length ?? 0) === 2), {
+      message: 'split requires exactly two operands.'
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false }
+  }, 'mcp_solid_operation', { timeoutMs: 180000 });
+
   registerTool(server, 'ocl_set_parts_visibility', {
     description:
       'Hide or show parts. Hidden parts are excluded from OpenCutList cutlists, so to show a hidden part pass the entity_ids returned by the hide call ' +
